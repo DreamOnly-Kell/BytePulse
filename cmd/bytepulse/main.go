@@ -16,6 +16,7 @@ import (
 	"bytepulse/internal/daemonclient"
 	"bytepulse/internal/proc"
 	"bytepulse/internal/processstate"
+	"bytepulse/internal/proctraffic"
 	"bytepulse/internal/storage"
 	"bytepulse/internal/tui"
 	"bytepulse/internal/units"
@@ -47,6 +48,7 @@ func newRootCommand() *cobra.Command {
 	cmd.PersistentFlags().IntVar(&cfg.TopN, "top-n", cfg.TopN, "default number of rows for process views")
 	cmd.PersistentFlags().DurationVar(&cfg.ProcessInterval, "process-interval", cfg.ProcessInterval, "process connection sampling interval")
 	cmd.PersistentFlags().StringVar(&cfg.DaemonAPIAddr, "daemon-api-addr", cfg.DaemonAPIAddr, "daemon local API address")
+	cmd.PersistentFlags().StringVar(&cfg.ProcessTraffic, "process-traffic", cfg.ProcessTraffic, "process traffic attribution mode: off, nettop")
 
 	cmd.AddCommand(newDaemonCommand(&cfg))
 	cmd.AddCommand(newStopCommand(&cfg))
@@ -115,6 +117,9 @@ func newDaemonCommand(cfg *config.Config) *cobra.Command {
 				Addr:    cfg.DaemonAPIAddr,
 				Handler: api.Handler(),
 			}
+			if cfg.ProcessTraffic != "off" && cfg.ProcessTraffic != "nettop" {
+				return fmt.Errorf("unsupported process traffic mode %q; use off or nettop", cfg.ProcessTraffic)
+			}
 
 			errCh := make(chan error, 3)
 			go func() {
@@ -132,9 +137,17 @@ func newDaemonCommand(cfg *config.Config) *cobra.Command {
 					errCh <- fmt.Errorf("process collector: %w", err)
 				}
 			}()
+			if cfg.ProcessTraffic == "nettop" {
+				pt := collector.NewProcessTrafficCollector(proctraffic.NewNettopAttributor(), procState)
+				go func() {
+					if err := pt.Run(runCtx); err != nil {
+						errCh <- fmt.Errorf("process traffic collector: %w", err)
+					}
+				}()
+			}
 
-			fmt.Printf("bytepulse daemon started, db=%s, interval=%s, process_interval=%s, api=http://%s\n",
-				cfg.DBPath, interval, cfg.ProcessInterval, cfg.DaemonAPIAddr)
+			fmt.Printf("bytepulse daemon started, db=%s, interval=%s, process_interval=%s, process_traffic=%s, api=http://%s\n",
+				cfg.DBPath, interval, cfg.ProcessInterval, cfg.ProcessTraffic, cfg.DaemonAPIAddr)
 			select {
 			case <-ctx.Done():
 				cancel()
@@ -177,7 +190,7 @@ func newProcessesCommand(cfg *config.Config) *cobra.Command {
 				defer ticker.Stop()
 				for {
 					fmt.Print("\033[H\033[2J")
-					if err := printRealtimeProcesses(cmd.Context(), client, limit); err != nil {
+					if err := printRealtimeProcesses(cmd.Context(), client, limit, cfg.UseBits); err != nil {
 						fmt.Println(err)
 					}
 					select {
@@ -187,7 +200,7 @@ func newProcessesCommand(cfg *config.Config) *cobra.Command {
 					}
 				}
 			}
-			return printRealtimeProcesses(cmd.Context(), client, limit)
+			return printRealtimeProcesses(cmd.Context(), client, limit, cfg.UseBits)
 		},
 	}
 
@@ -197,12 +210,12 @@ func newProcessesCommand(cfg *config.Config) *cobra.Command {
 	return cmd
 }
 
-func printRealtimeProcesses(ctx context.Context, client *daemonclient.Client, limit int) error {
+func printRealtimeProcesses(ctx context.Context, client *daemonclient.Client, limit int, bits bool) error {
 	items, err := client.Processes(ctx, limit)
 	if err != nil {
 		return fmt.Errorf("daemon API unavailable; start it with: bytepulse daemon")
 	}
-	printProcessRows(items)
+	printProcessRows(items, bits)
 	return nil
 }
 
@@ -226,13 +239,15 @@ func printHistoricalProcesses(cfg *config.Config, rangeText string, limit int) e
 	return nil
 }
 
-func printProcessRows(items []processstate.ProcessConnectionSummary) {
-	fmt.Printf("%-7s %-18s %-6s %-8s %s\n", "PID", "NAME", "CONNS", "LAST", "PATH")
+func printProcessRows(items []processstate.ProcessConnectionSummary, bits bool) {
+	fmt.Printf("%-7s %-18s %-6s %-12s %-12s %-8s %s\n", "PID", "NAME", "CONNS", "RX/s", "TX/s", "LAST", "PATH")
 	for _, item := range items {
-		fmt.Printf("%-7d %-18s %-6d %-8s %s\n",
+		fmt.Printf("%-7d %-18s %-6d %-12s %-12s %-8s %s\n",
 			item.PID,
 			truncateText(item.ProcessName, 18),
 			item.ConnectionCount,
+			formatOptionalRate(item.RXBps, item.TrafficAvailable, bits),
+			formatOptionalRate(item.TXBps, item.TrafficAvailable, bits),
 			item.LastSeen.Local().Format("15:04:05"),
 			displayPath(item.ProcessPath, item.ProcessName),
 		)
@@ -243,12 +258,14 @@ func printProcessRows(items []processstate.ProcessConnectionSummary) {
 }
 
 func printStorageProcessRows(items []storage.ProcessConnectionSummary) {
-	fmt.Printf("%-7s %-18s %-6s %-8s %s\n", "PID", "NAME", "CONNS", "LAST", "PATH")
+	fmt.Printf("%-7s %-18s %-6s %-12s %-12s %-8s %s\n", "PID", "NAME", "CONNS", "RX/s", "TX/s", "LAST", "PATH")
 	for _, item := range items {
-		fmt.Printf("%-7d %-18s %-6d %-8s %s\n",
+		fmt.Printf("%-7d %-18s %-6d %-12s %-12s %-8s %s\n",
 			item.PID,
 			truncateText(item.ProcessName, 18),
 			item.ConnectionCount,
+			"--",
+			"--",
 			item.LastSeen.Local().Format("15:04:05"),
 			displayPath(item.ProcessPath, item.ProcessName),
 		)
@@ -256,6 +273,13 @@ func printStorageProcessRows(items []storage.ProcessConnectionSummary) {
 	if len(items) == 0 {
 		fmt.Println("no process connection history yet")
 	}
+}
+
+func formatOptionalRate(rate float64, ok bool, bits bool) string {
+	if !ok {
+		return "--"
+	}
+	return units.FormatRate(rate, bits)
 }
 
 func displayPath(path, fallback string) string {

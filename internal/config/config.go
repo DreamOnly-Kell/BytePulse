@@ -17,6 +17,7 @@ type Config struct {
 	TopN            int
 	ProcessInterval time.Duration
 	DaemonAPIAddr   string
+	ProcessTraffic  string
 }
 
 func Default() Config {
@@ -32,6 +33,7 @@ func Default() Config {
 		TopN:            30,
 		ProcessInterval: time.Second,
 		DaemonAPIAddr:   "127.0.0.1:8988",
+		ProcessTraffic:  "off",
 	}
 }
 

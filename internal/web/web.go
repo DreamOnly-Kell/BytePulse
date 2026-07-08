@@ -265,7 +265,7 @@ const indexHTML = `<!doctype html>
     <section class="panel" style="margin-top:12px">
       <div class="label" id="process-status">Processes</div>
       <table>
-        <thead><tr><th>PID</th><th>Name</th><th>Path</th><th>Connections</th><th>Last Seen</th></tr></thead>
+        <thead><tr><th>PID</th><th>Name</th><th>Path</th><th>Connections</th><th>RX/s</th><th>TX/s</th><th>Last Seen</th></tr></thead>
         <tbody id="processes"></tbody>
       </table>
     </section>
@@ -362,9 +362,10 @@ const indexHTML = `<!doctype html>
           const processes = await processResp.json();
           document.getElementById("process-status").textContent = "Processes";
           document.getElementById("processes").innerHTML = processes.length === 0
-            ? "<tr><td colspan=\"5\">No process connection samples yet</td></tr>"
+            ? "<tr><td colspan=\"7\">No process connection samples yet</td></tr>"
             : processes.map(p => {
-                return "<tr><td>" + (p.pid || 0) + "</td><td>" + (p.process_name || "unknown") + "</td><td>" + (p.process_path || p.process_name || "") + "</td><td>" + (p.connection_count || 0) + "</td><td>" + new Date(p.last_seen).toLocaleTimeString() + "</td></tr>";
+                const hasTraffic = !!p.traffic_available;
+                return "<tr><td>" + (p.pid || 0) + "</td><td>" + (p.process_name || "unknown") + "</td><td>" + (p.process_path || p.process_name || "") + "</td><td>" + (p.connection_count || 0) + "</td><td>" + (hasTraffic ? fmtRate(p.rx_bps || 0) : "--") + "</td><td>" + (hasTraffic ? fmtRate(p.tx_bps || 0) : "--") + "</td><td>" + new Date(p.last_seen).toLocaleTimeString() + "</td></tr>";
               }).join("");
         }
       } catch (err) {

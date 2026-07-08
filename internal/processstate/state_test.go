@@ -70,6 +70,72 @@ func TestUpdateCarriesProcessPath(t *testing.T) {
 	}
 }
 
+func TestUpdateTrafficMergesRatesIntoLatestSummaries(t *testing.T) {
+	state := New()
+	now := time.Date(2026, 7, 8, 10, 15, 1, 0, time.UTC)
+	state.Update([]proc.Connection{
+		{PID: 1, ProcessName: "curl", ProcessPath: "/usr/bin/curl", ProcessKey: "1:1", SeenAt: now},
+	}, now)
+
+	state.UpdateTraffic([]ProcessTrafficSample{
+		{PID: 1, RXBytes: 3000, TXBytes: 1000, RXBps: 3000, TXBps: 1000, SeenAt: now, Source: "nettop"},
+	})
+
+	got := state.LatestSummaries(10)
+	if len(got) != 1 {
+		t.Fatalf("len=%d, want 1", len(got))
+	}
+	if got[0].RXBps != 3000 || got[0].TXBps != 1000 {
+		t.Fatalf("rates rx=%v tx=%v, want 3000/1000", got[0].RXBps, got[0].TXBps)
+	}
+	if !got[0].TrafficAvailable {
+		t.Fatalf("traffic should be available")
+	}
+	if got[0].TrafficSource != "nettop" {
+		t.Fatalf("source=%q, want nettop", got[0].TrafficSource)
+	}
+}
+
+func TestUpdatePreservesLatestTrafficAcrossConnectionRefresh(t *testing.T) {
+	state := New()
+	now := time.Date(2026, 7, 8, 10, 15, 1, 0, time.UTC)
+	state.UpdateTraffic([]ProcessTrafficSample{
+		{PID: 1, RXBytes: 3000, TXBytes: 1000, RXBps: 3000, TXBps: 1000, SeenAt: now, Source: "nettop"},
+	})
+
+	state.Update([]proc.Connection{
+		{PID: 1, ProcessName: "curl", ProcessPath: "/usr/bin/curl", ProcessKey: "1:1", SeenAt: now.Add(time.Second)},
+	}, now.Add(time.Second))
+
+	got := state.LatestSummaries(10)
+	if len(got) != 1 {
+		t.Fatalf("len=%d, want 1", len(got))
+	}
+	if !got[0].TrafficAvailable {
+		t.Fatalf("traffic should remain available after connection refresh")
+	}
+	if got[0].RXBps != 3000 || got[0].TXBps != 1000 {
+		t.Fatalf("rates rx=%v tx=%v, want 3000/1000", got[0].RXBps, got[0].TXBps)
+	}
+}
+
+func TestUpdateTrafficDoesNotOverwriteConnectionPath(t *testing.T) {
+	state := New()
+	now := time.Date(2026, 7, 8, 10, 15, 1, 0, time.UTC)
+	state.Update([]proc.Connection{
+		{PID: 1, ProcessName: "curl", ProcessPath: "/usr/bin/curl", ProcessKey: "1:1", SeenAt: now},
+	}, now)
+
+	state.UpdateTraffic([]ProcessTrafficSample{
+		{PID: 1, ProcessName: "curl", ProcessPath: "curl", RXBps: 1, TXBps: 2, SeenAt: now, Source: "nettop"},
+	})
+
+	got := state.LatestSummaries(10)
+	if got[0].ProcessPath != "/usr/bin/curl" {
+		t.Fatalf("path=%q, want original full path", got[0].ProcessPath)
+	}
+}
+
 func TestMinuteBucketAccumulatesSampleCountAndMaxConnections(t *testing.T) {
 	state := New()
 	now := time.Date(2026, 7, 8, 10, 15, 1, 0, time.UTC)

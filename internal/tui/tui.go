@@ -192,13 +192,15 @@ func (m model) processView() string {
 		b.WriteString("\n")
 		return b.String()
 	}
-	pathWidth := max(16, m.width-48)
-	b.WriteString(fmt.Sprintf("%-7s %-16s %-6s %-8s %s\n", "PID", "NAME", "CONNS", "LAST", "PATH"))
+	pathWidth := max(16, m.width-74)
+	b.WriteString(fmt.Sprintf("%-7s %-16s %-6s %-11s %-11s %-8s %s\n", "PID", "NAME", "CONNS", "RX/s", "TX/s", "LAST", "PATH"))
 	for _, item := range m.procs {
-		b.WriteString(fmt.Sprintf("%-7d %-16s %-6d %-8s %s\n",
+		b.WriteString(fmt.Sprintf("%-7d %-16s %-6d %-11s %-11s %-8s %s\n",
 			item.PID,
 			truncate(item.ProcessName, 16),
 			item.ConnectionCount,
+			truncate(formatOptionalRate(item.RXBps, item.TrafficAvailable, m.cfg.UseBits), 11),
+			truncate(formatOptionalRate(item.TXBps, item.TrafficAvailable, m.cfg.UseBits), 11),
 			item.LastSeen.Local().Format("15:04:05"),
 			truncate(displayPath(item.ProcessPath, item.ProcessName), pathWidth),
 		))
@@ -214,6 +216,13 @@ func displayPath(path, fallback string) string {
 		return path
 	}
 	return fallback
+}
+
+func formatOptionalRate(rate float64, ok bool, bits bool) string {
+	if !ok {
+		return "--"
+	}
+	return units.FormatRate(rate, bits)
 }
 
 func renderRates(sample storage.Sample, bits bool) string {

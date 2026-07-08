@@ -112,36 +112,28 @@ func TestProcessConnectionCollectorUnsupportedSamplerExitsNil(t *testing.T) {
 
 func TestProcessConnectionCollectorContinuesAfterTransientSampleError(t *testing.T) {
 	state := processstate.New()
+	now := time.Date(2026, 7, 8, 10, 15, 1, 0, time.UTC)
 	sampler := &fakeProcessSampler{
 		errs: []error{errors.New("temporary")},
 		results: [][]proc.Connection{
 			nil,
-			{{PID: 1, ProcessName: "curl", ProcessKey: "1:0", SeenAt: time.Now()}},
+			{{PID: 1, ProcessName: "curl", ProcessKey: "1:0", SeenAt: now}},
 		},
 	}
 	store := &fakeProcessStore{}
 	collector := NewProcessConnectionCollector(store, sampler, state, ProcessConnectionOptions{Interval: time.Millisecond})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- collector.Run(ctx) }()
-
-	deadline := time.After(3 * time.Second)
-	for {
-		if len(state.LatestSummaries(10)) > 0 {
-			cancel()
-			if err := <-done; err != nil {
-				t.Fatalf("run: %v", err)
-			}
-			return
-		}
-		select {
-		case <-deadline:
-			cancel()
-			t.Fatalf("state was not updated after transient error")
-		default:
-			time.Sleep(time.Millisecond)
-		}
+	if err := collector.sampleOnce(now); err != nil {
+		t.Fatalf("first sample: %v", err)
+	}
+	if len(state.LatestSummaries(10)) != 0 {
+		t.Fatalf("state updated after transient error")
+	}
+	if err := collector.sampleOnce(now.Add(time.Second)); err != nil {
+		t.Fatalf("second sample: %v", err)
+	}
+	if len(state.LatestSummaries(10)) != 1 {
+		t.Fatalf("state was not updated after transient error")
 	}
 }
 

@@ -23,12 +23,30 @@ type ProcessConnectionDetail struct {
 }
 
 type ProcessConnectionSummary struct {
-	PID             int       `json:"pid"`
-	ProcessName     string    `json:"process_name"`
-	ProcessPath     string    `json:"process_path"`
-	ProcessKey      string    `json:"process_key"`
-	ConnectionCount int       `json:"connection_count"`
-	LastSeen        time.Time `json:"last_seen"`
+	PID              int       `json:"pid"`
+	ProcessName      string    `json:"process_name"`
+	ProcessPath      string    `json:"process_path"`
+	ProcessKey       string    `json:"process_key"`
+	ConnectionCount  int       `json:"connection_count"`
+	RXBytes          uint64    `json:"rx_bytes"`
+	TXBytes          uint64    `json:"tx_bytes"`
+	RXBps            float64   `json:"rx_bps"`
+	TXBps            float64   `json:"tx_bps"`
+	TrafficSource    string    `json:"traffic_source"`
+	TrafficAvailable bool      `json:"traffic_available"`
+	LastSeen         time.Time `json:"last_seen"`
+}
+
+type ProcessTrafficSample struct {
+	PID         int       `json:"pid"`
+	ProcessName string    `json:"process_name"`
+	ProcessPath string    `json:"process_path"`
+	RXBytes     uint64    `json:"rx_bytes"`
+	TXBytes     uint64    `json:"tx_bytes"`
+	RXBps       float64   `json:"rx_bps"`
+	TXBps       float64   `json:"tx_bps"`
+	SeenAt      time.Time `json:"seen_at"`
+	Source      string    `json:"source"`
 }
 
 type ProcessConnectionMinute struct {
@@ -46,12 +64,14 @@ type State struct {
 	mu                sync.RWMutex
 	latestSummaries   []ProcessConnectionSummary
 	latestConnections map[string][]ProcessConnectionDetail
+	latestTraffic     map[int]ProcessTrafficSample
 	minuteBuckets     map[string]ProcessConnectionMinute
 }
 
 func New() *State {
 	return &State{
 		latestConnections: map[string][]ProcessConnectionDetail{},
+		latestTraffic:     map[int]ProcessTrafficSample{},
 		minuteBuckets:     map[string]ProcessConnectionMinute{},
 	}
 }
@@ -97,6 +117,9 @@ func (s *State) Update(conns []proc.Connection, now time.Time) {
 			ConnectionCount: len(details),
 			LastSeen:        lastSeen,
 		}
+		if sample, ok := s.latestTraffic[summary.PID]; ok {
+			applyTraffic(&summary, sample)
+		}
 		s.latestSummaries = append(s.latestSummaries, summary)
 
 		bucketKey := bucketKey(minuteStart, key)
@@ -131,6 +154,31 @@ func (s *State) LatestSummaries(limit int) []ProcessConnectionSummary {
 		items = items[:limit]
 	}
 	return items
+}
+
+func (s *State) UpdateTraffic(samples []ProcessTrafficSample) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	byPID := map[int]ProcessTrafficSample{}
+	for _, sample := range samples {
+		if sample.PID <= 0 {
+			continue
+		}
+		byPID[sample.PID] = sample
+		s.latestTraffic[sample.PID] = sample
+	}
+	if len(byPID) == 0 {
+		return
+	}
+
+	for i := range s.latestSummaries {
+		sample, ok := byPID[s.latestSummaries[i].PID]
+		if !ok {
+			continue
+		}
+		applyTraffic(&s.latestSummaries[i], sample)
+	}
 }
 
 func (s *State) LatestConnections(processKey string) []ProcessConnectionDetail {
@@ -183,6 +231,24 @@ func sortSummaries(items []ProcessConnectionSummary) {
 		}
 		return items[i].PID < items[j].PID
 	})
+}
+
+func applyTraffic(summary *ProcessConnectionSummary, sample ProcessTrafficSample) {
+	summary.RXBytes = sample.RXBytes
+	summary.TXBytes = sample.TXBytes
+	summary.RXBps = sample.RXBps
+	summary.TXBps = sample.TXBps
+	summary.TrafficSource = sample.Source
+	summary.TrafficAvailable = true
+	if (summary.ProcessName == "" || summary.ProcessName == "unknown") && sample.ProcessName != "" {
+		summary.ProcessName = sample.ProcessName
+	}
+	if summary.ProcessPath == "" && sample.ProcessPath != "" {
+		summary.ProcessPath = sample.ProcessPath
+	}
+	if sample.SeenAt.After(summary.LastSeen) {
+		summary.LastSeen = sample.SeenAt
+	}
 }
 
 func bucketKey(minuteStart time.Time, processKey string) string {

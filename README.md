@@ -15,9 +15,10 @@ BytePulse is a local network traffic monitor with CLI, TUI, and Web dashboards. 
 - Per-interface filtering with `--interface`.
 - Process connection discovery on macOS: process name, full process path, PID, connection count, and last seen time.
 - 1-second realtime process refresh through the daemon API for CLI, TUI, and Web.
+- Optional macOS per-process realtime traffic attribution through `nettop`.
 - Local SQLite storage.
 - No packet capture; BytePulse reads operating-system network counters.
-- No per-process RX/TX byte attribution yet.
+- Per-process RX/TX rates are optional on macOS through `--process-traffic nettop`.
 
 ## Platform Support
 
@@ -29,7 +30,7 @@ BytePulse is designed to be cross-platform. The current implementation uses Go a
 | Linux | Core monitoring expected; process connection discovery currently disabled |
 | Windows | Core monitoring expected; process connection discovery currently disabled |
 
-Phase 2A process monitoring shows which processes have network connections. It does not yet attribute exact per-process traffic bytes or speeds; that requires platform-specific traffic attribution work. Linux and Windows process discovery are planned as platform-specific follow-ups.
+Phase 2A process monitoring shows which processes have network connections. macOS can optionally estimate per-process realtime traffic by parsing `nettop`; this is off by default because `nettop` is a system tool rather than a stable SDK API. Linux and Windows process discovery are planned as platform-specific follow-ups.
 
 ## Build
 
@@ -123,6 +124,15 @@ Show processes currently using the network:
 ```
 
 Process views show both `NAME` and `PATH`. `NAME` is the short executable name; `PATH` preserves the full process path when the platform provides it.
+
+Enable macOS per-process realtime traffic:
+
+```bash
+./bytepulse --process-traffic nettop daemon
+./bytepulse processes --watch
+```
+
+When traffic attribution is unavailable, process views keep showing connection counts and display `--` for `RX/s` and `TX/s`.
 
 List network interfaces:
 
@@ -244,7 +254,7 @@ GET /api/processes/top?range=24h&limit=30
 - macOS `launchd` service setup.
 - Minute/hour/day aggregate tables for lower long-term storage usage.
 - Linux and Windows process connection discovery.
-- Per-process traffic byte attribution as a separate future phase.
+- More robust per-process traffic attribution backends.
 - Desktop tray or widget integration.
 
 ## License

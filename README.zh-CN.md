@@ -15,9 +15,10 @@ BytePulse 是一个本地网络流量监控工具，提供 CLI、TUI 和本地 W
 - 支持通过 `--interface` 查看指定网卡。
 - macOS 支持进程连接发现：进程名、完整进程路径、PID、连接数和最后出现时间。
 - CLI、TUI、Web 的进程视图通过 daemon API 每 1 秒实时刷新。
+- macOS 可选通过 `nettop` 显示按进程实时流量。
 - 使用本地 SQLite 存储数据。
 - 不抓包，只读取操作系统网络计数器。
-- 当前不提供按进程 RX/TX 字节归因。
+- macOS 可通过 `--process-traffic nettop` 选择性显示按进程 RX/TX 速率。
 
 ## 平台支持
 
@@ -29,7 +30,7 @@ BytePulse 设计目标是多平台支持。当前实现使用 Go 和 `gopsutil` 
 | Linux | 核心监控预期支持；进程连接发现当前禁用 |
 | Windows | 核心监控预期支持；进程连接发现当前禁用 |
 
-Phase 2A 的进程监控显示“哪些进程存在网络连接”。它还不提供精确的按进程流量字节数或速度；这需要平台专用的流量归因方案。Linux 和 Windows 的进程发现会作为后续平台适配实现。
+Phase 2A 的进程监控显示“哪些进程存在网络连接”。macOS 可以选择解析 `nettop` 来估算按进程实时流量；该能力默认关闭，因为 `nettop` 是系统工具而不是稳定 SDK API。Linux 和 Windows 的进程发现会作为后续平台适配实现。
 
 ## 构建
 
@@ -123,6 +124,15 @@ zip -j dist/bytepulse-windows-arm64.zip dist/bytepulse-windows-arm64.exe
 ```
 
 进程视图同时显示 `NAME` 和 `PATH`。`NAME` 是短进程名；`PATH` 在平台能提供时保留完整进程路径。
+
+启用 macOS 按进程实时流量：
+
+```bash
+./bytepulse --process-traffic nettop daemon
+./bytepulse processes --watch
+```
+
+当流量归因不可用时，进程视图仍显示连接数，`RX/s` 和 `TX/s` 显示为 `--`。
 
 列出网络接口：
 
@@ -244,7 +254,7 @@ GET /api/processes/top?range=24h&limit=30
 - 支持 macOS `launchd` 后台服务安装。
 - 增加分钟、小时、天聚合表，降低长期存储占用。
 - 增加 Linux 和 Windows 进程连接发现。
-- 按进程流量字节归因作为后续独立阶段。
+- 增加更稳定的按进程流量归因后端。
 - 增加桌面托盘或桌面小组件。
 
 ## 协议
