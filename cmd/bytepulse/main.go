@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -11,6 +12,10 @@ import (
 
 	"bytepulse/internal/collector"
 	"bytepulse/internal/config"
+	"bytepulse/internal/daemonapi"
+	"bytepulse/internal/daemonclient"
+	"bytepulse/internal/proc"
+	"bytepulse/internal/processstate"
 	"bytepulse/internal/storage"
 	"bytepulse/internal/tui"
 	"bytepulse/internal/units"
@@ -38,12 +43,17 @@ func newRootCommand() *cobra.Command {
 	cmd.PersistentFlags().StringVar(&cfg.PIDPath, "pid-file", cfg.PIDPath, "daemon PID file path")
 	cmd.PersistentFlags().StringVar(&cfg.Interface, "interface", "", "interface name to query; empty means all non-loopback interfaces")
 	cmd.PersistentFlags().BoolVar(&cfg.UseBits, "bits", false, "display rates as bits/s instead of bytes/s")
+	cmd.PersistentFlags().DurationVar(&cfg.Retention, "retention", cfg.Retention, "data retention period")
+	cmd.PersistentFlags().IntVar(&cfg.TopN, "top-n", cfg.TopN, "default number of rows for process views")
+	cmd.PersistentFlags().DurationVar(&cfg.ProcessInterval, "process-interval", cfg.ProcessInterval, "process connection sampling interval")
+	cmd.PersistentFlags().StringVar(&cfg.DaemonAPIAddr, "daemon-api-addr", cfg.DaemonAPIAddr, "daemon local API address")
 
 	cmd.AddCommand(newDaemonCommand(&cfg))
 	cmd.AddCommand(newStopCommand(&cfg))
 	cmd.AddCommand(newStatusCommand(&cfg))
 	cmd.AddCommand(newReportCommand(&cfg))
 	cmd.AddCommand(newInterfacesCommand(&cfg))
+	cmd.AddCommand(newProcessesCommand(&cfg))
 	cmd.AddCommand(newTUICommand(&cfg))
 	cmd.AddCommand(newWebCommand(&cfg))
 
@@ -82,18 +92,187 @@ func newDaemonCommand(cfg *config.Config) *cobra.Command {
 
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
+			runCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
 
 			c := collector.New(store, collector.Options{
 				Interval:  interval,
 				Interface: cfg.Interface,
+				Retention: cfg.Retention,
 			})
-			fmt.Printf("bytepulse daemon started, db=%s, interval=%s\n", cfg.DBPath, interval)
-			return c.Run(ctx)
+			procState := processstate.New()
+			pc := collector.NewProcessConnectionCollector(
+				store,
+				proc.NewSampler(),
+				procState,
+				collector.ProcessConnectionOptions{
+					Interval:  cfg.ProcessInterval,
+					Retention: cfg.Retention,
+				},
+			)
+			api := daemonapi.NewServer(procState, store, *cfg)
+			apiServer := &http.Server{
+				Addr:    cfg.DaemonAPIAddr,
+				Handler: api.Handler(),
+			}
+
+			errCh := make(chan error, 3)
+			go func() {
+				if err := apiServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					errCh <- fmt.Errorf("daemon API: %w", err)
+				}
+			}()
+			go func() {
+				if err := c.Run(runCtx); err != nil {
+					errCh <- fmt.Errorf("collector: %w", err)
+				}
+			}()
+			go func() {
+				if err := pc.Run(runCtx); err != nil {
+					errCh <- fmt.Errorf("process collector: %w", err)
+				}
+			}()
+
+			fmt.Printf("bytepulse daemon started, db=%s, interval=%s, process_interval=%s, api=http://%s\n",
+				cfg.DBPath, interval, cfg.ProcessInterval, cfg.DaemonAPIAddr)
+			select {
+			case <-ctx.Done():
+				cancel()
+				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer shutdownCancel()
+				_ = apiServer.Shutdown(shutdownCtx)
+				return nil
+			case err := <-errCh:
+				cancel()
+				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer shutdownCancel()
+				_ = apiServer.Shutdown(shutdownCtx)
+				return err
+			}
 		},
 	}
 
 	cmd.Flags().DurationVar(&interval, "interval", time.Second, "sampling interval")
 	return cmd
+}
+
+func newProcessesCommand(cfg *config.Config) *cobra.Command {
+	var limit int
+	var rangeText string
+	var watch bool
+
+	cmd := &cobra.Command{
+		Use:   "processes",
+		Short: "Show processes currently using the network",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if limit <= 0 {
+				limit = cfg.TopN
+			}
+			if rangeText != "" {
+				return printHistoricalProcesses(cfg, rangeText, limit)
+			}
+			client := daemonclient.New(cfg.DaemonAPIAddr)
+			if watch {
+				ticker := time.NewTicker(time.Second)
+				defer ticker.Stop()
+				for {
+					fmt.Print("\033[H\033[2J")
+					if err := printRealtimeProcesses(cmd.Context(), client, limit); err != nil {
+						fmt.Println(err)
+					}
+					select {
+					case <-cmd.Context().Done():
+						return nil
+					case <-ticker.C:
+					}
+				}
+			}
+			return printRealtimeProcesses(cmd.Context(), client, limit)
+		},
+	}
+
+	cmd.Flags().IntVar(&limit, "limit", cfg.TopN, "number of process rows to show")
+	cmd.Flags().StringVar(&rangeText, "range", "", "historical range: 1h,2h,3h,5h,10h,12h,24h,2d,3d,7d,15d")
+	cmd.Flags().BoolVar(&watch, "watch", false, "refresh realtime process view every second")
+	return cmd
+}
+
+func printRealtimeProcesses(ctx context.Context, client *daemonclient.Client, limit int) error {
+	items, err := client.Processes(ctx, limit)
+	if err != nil {
+		return fmt.Errorf("daemon API unavailable; start it with: bytepulse daemon")
+	}
+	printProcessRows(items)
+	return nil
+}
+
+func printHistoricalProcesses(cfg *config.Config, rangeText string, limit int) error {
+	d, err := config.ParseRange(rangeText)
+	if err != nil {
+		return err
+	}
+	store, err := openStore(cfg)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
+	now := time.Now()
+	items, err := store.TopProcessConnectionMinutes(now.Add(-d), now, limit)
+	if err != nil {
+		return err
+	}
+	printStorageProcessRows(items)
+	return nil
+}
+
+func printProcessRows(items []processstate.ProcessConnectionSummary) {
+	fmt.Printf("%-7s %-18s %-6s %-8s %s\n", "PID", "NAME", "CONNS", "LAST", "PATH")
+	for _, item := range items {
+		fmt.Printf("%-7d %-18s %-6d %-8s %s\n",
+			item.PID,
+			truncateText(item.ProcessName, 18),
+			item.ConnectionCount,
+			item.LastSeen.Local().Format("15:04:05"),
+			displayPath(item.ProcessPath, item.ProcessName),
+		)
+	}
+	if len(items) == 0 {
+		fmt.Println("no process connection samples yet")
+	}
+}
+
+func printStorageProcessRows(items []storage.ProcessConnectionSummary) {
+	fmt.Printf("%-7s %-18s %-6s %-8s %s\n", "PID", "NAME", "CONNS", "LAST", "PATH")
+	for _, item := range items {
+		fmt.Printf("%-7d %-18s %-6d %-8s %s\n",
+			item.PID,
+			truncateText(item.ProcessName, 18),
+			item.ConnectionCount,
+			item.LastSeen.Local().Format("15:04:05"),
+			displayPath(item.ProcessPath, item.ProcessName),
+		)
+	}
+	if len(items) == 0 {
+		fmt.Println("no process connection history yet")
+	}
+}
+
+func displayPath(path, fallback string) string {
+	if path != "" {
+		return path
+	}
+	return fallback
+}
+
+func truncateText(text string, width int) string {
+	if len(text) <= width {
+		return text
+	}
+	if width <= 3 {
+		return text[:width]
+	}
+	return text[:width-3] + "..."
 }
 
 func newStopCommand(cfg *config.Config) *cobra.Command {

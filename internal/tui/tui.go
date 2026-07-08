@@ -1,11 +1,14 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
 
 	"bytepulse/internal/config"
+	"bytepulse/internal/daemonclient"
+	"bytepulse/internal/processstate"
 	"bytepulse/internal/storage"
 	"bytepulse/internal/units"
 
@@ -14,15 +17,19 @@ import (
 )
 
 type model struct {
-	store  *storage.Store
-	cfg    config.Config
-	width  int
-	height int
-	latest storage.Sample
-	ranges []rangeStat
-	series []storage.Sample
-	err    error
-	loaded bool
+	store         *storage.Store
+	cfg           config.Config
+	width         int
+	height        int
+	latest        storage.Sample
+	ranges        []rangeStat
+	series        []storage.Sample
+	err           error
+	loaded        bool
+	processClient *daemonclient.Client
+	procs         []processstate.ProcessConnectionSummary
+	showProc      bool
+	processErr    error
 }
 
 type rangeStat struct {
@@ -47,8 +54,9 @@ func Run(store *storage.Store, cfg config.Config) error {
 
 func newModel(store *storage.Store, cfg config.Config) model {
 	return model{
-		store: store,
-		cfg:   cfg,
+		store:         store,
+		cfg:           cfg,
+		processClient: daemonclient.New(cfg.DaemonAPIAddr),
 		ranges: []rangeStat{
 			{Label: "1h"},
 			{Label: "2h"},
@@ -75,6 +83,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c", "esc":
 			return m, tea.Quit
+		case "tab":
+			m.showProc = !m.showProc
 		}
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -117,9 +127,24 @@ func (m *model) refresh() {
 		return
 	}
 	m.series = series
+
+	if m.processClient != nil {
+		procs, err := m.processClient.Processes(context.Background(), m.cfg.TopN)
+		if err != nil {
+			m.procs = nil
+			m.processErr = err
+		} else {
+			m.procs = procs
+			m.processErr = nil
+		}
+	}
 }
 
 func (m model) View() string {
+	if m.showProc {
+		return m.processView()
+	}
+
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("BytePulse"))
 	b.WriteString("  ")
@@ -145,9 +170,50 @@ func (m model) View() string {
 	b.WriteString("\n\n")
 	b.WriteString(renderRanges(m.ranges, m.cfg.UseBits))
 	b.WriteString("\n")
-	b.WriteString(labelStyle.Render("q: quit"))
+	b.WriteString(labelStyle.Render("tab: switch view | q: quit"))
 	b.WriteString("\n")
 	return b.String()
+}
+
+func (m model) processView() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("BytePulse [Processes]"))
+	b.WriteString("\n\n")
+	if m.processErr != nil {
+		b.WriteString(errorStyle.Render("Daemon API unavailable. Start bytepulse daemon."))
+		b.WriteString("\n\n")
+		b.WriteString(labelStyle.Render("tab: switch view | q: quit"))
+		b.WriteString("\n")
+		return b.String()
+	}
+	if len(m.procs) == 0 {
+		b.WriteString("Waiting for process connection data...\n\n")
+		b.WriteString(labelStyle.Render("tab: switch view | q: quit"))
+		b.WriteString("\n")
+		return b.String()
+	}
+	pathWidth := max(16, m.width-48)
+	b.WriteString(fmt.Sprintf("%-7s %-16s %-6s %-8s %s\n", "PID", "NAME", "CONNS", "LAST", "PATH"))
+	for _, item := range m.procs {
+		b.WriteString(fmt.Sprintf("%-7d %-16s %-6d %-8s %s\n",
+			item.PID,
+			truncate(item.ProcessName, 16),
+			item.ConnectionCount,
+			item.LastSeen.Local().Format("15:04:05"),
+			truncate(displayPath(item.ProcessPath, item.ProcessName), pathWidth),
+		))
+	}
+	b.WriteString("\n")
+	b.WriteString(labelStyle.Render("tab: switch view | q: quit"))
+	b.WriteString("\n")
+	return b.String()
+}
+
+func displayPath(path, fallback string) string {
+	if path != "" {
+		return path
+	}
+	return fallback
 }
 
 func renderRates(sample storage.Sample, bits bool) string {
@@ -227,4 +293,14 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func truncate(text string, width int) string {
+	if len(text) <= width {
+		return text
+	}
+	if width <= 3 {
+		return text[:width]
+	}
+	return text[:width-3] + "..."
 }

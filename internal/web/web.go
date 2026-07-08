@@ -1,27 +1,37 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"bytepulse/internal/config"
+	"bytepulse/internal/daemonclient"
+	"bytepulse/internal/processstate"
 	"bytepulse/internal/storage"
 )
 
+type processClient interface {
+	Processes(context.Context, int) ([]processstate.ProcessConnectionSummary, error)
+}
+
 type Server struct {
-	store *storage.Store
-	cfg   config.Config
-	mux   *http.ServeMux
+	store         *storage.Store
+	cfg           config.Config
+	mux           *http.ServeMux
+	processClient processClient
 }
 
 func New(store *storage.Store, cfg config.Config) *Server {
 	s := &Server{
-		store: store,
-		cfg:   cfg,
-		mux:   http.NewServeMux(),
+		store:         store,
+		cfg:           cfg,
+		mux:           http.NewServeMux(),
+		processClient: daemonclient.New(cfg.DaemonAPIAddr),
 	}
 	s.routes()
 	return s
@@ -39,6 +49,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/hourly", s.handleHourly)
 	s.mux.HandleFunc("/api/daily", s.handleDaily)
 	s.mux.HandleFunc("/api/series", s.handleSeries)
+	s.mux.HandleFunc("/api/processes", s.handleProcesses)
+	s.mux.HandleFunc("/api/processes/top", s.handleProcessesTop)
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -126,6 +138,60 @@ func (s *Server) handleSeries(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, series)
 }
 
+func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
+	limit, err := s.parseLimit(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	items, err := s.processClient.Processes(r.Context(), limit)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("daemon API unavailable: %w", err))
+		return
+	}
+	writeJSON(w, items)
+}
+
+func (s *Server) handleProcessesTop(w http.ResponseWriter, r *http.Request) {
+	limit, err := s.parseLimit(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	rangeText := r.URL.Query().Get("range")
+	if rangeText == "" {
+		rangeText = "24h"
+	}
+	d, err := config.ParseRange(rangeText)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	now := time.Now()
+	items, err := s.store.TopProcessConnectionMinutes(now.Add(-d), now, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, items)
+}
+
+func (s *Server) parseLimit(r *http.Request) (int, error) {
+	limit := s.cfg.TopN
+	if limit <= 0 {
+		limit = 30
+	}
+	text := r.URL.Query().Get("limit")
+	if text == "" {
+		return limit, nil
+	}
+	parsed, err := strconv.Atoi(text)
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("limit must be a positive integer")
+	}
+	return parsed, nil
+}
+
 func (s *Server) interfaceName(r *http.Request) string {
 	if v := r.URL.Query().Get("interface"); v != "" {
 		return v
@@ -194,6 +260,13 @@ const indexHTML = `<!doctype html>
       <table>
         <thead><tr><th>Range</th><th>Download</th><th>Upload</th><th>Total</th><th>Avg total</th></tr></thead>
         <tbody id="ranges"></tbody>
+      </table>
+    </section>
+    <section class="panel" style="margin-top:12px">
+      <div class="label" id="process-status">Processes</div>
+      <table>
+        <thead><tr><th>PID</th><th>Name</th><th>Path</th><th>Connections</th><th>Last Seen</th></tr></thead>
+        <tbody id="processes"></tbody>
       </table>
     </section>
   </main>
@@ -280,6 +353,20 @@ const indexHTML = `<!doctype html>
           const avg = total / Math.max(1, s.duration_sec || 1);
           return "<tr><td>" + row.range + "</td><td>" + fmtBytes(s.rx_bytes || 0) + "</td><td>" + fmtBytes(s.tx_bytes || 0) + "</td><td>" + fmtBytes(total) + "</td><td>" + fmtRate(avg) + "</td></tr>";
         }).join("");
+
+        const processResp = await fetch("/api/processes");
+        if (!processResp.ok) {
+          document.getElementById("process-status").textContent = "Processes - daemon API unavailable";
+          document.getElementById("processes").innerHTML = "";
+        } else {
+          const processes = await processResp.json();
+          document.getElementById("process-status").textContent = "Processes";
+          document.getElementById("processes").innerHTML = processes.length === 0
+            ? "<tr><td colspan=\"5\">No process connection samples yet</td></tr>"
+            : processes.map(p => {
+                return "<tr><td>" + (p.pid || 0) + "</td><td>" + (p.process_name || "unknown") + "</td><td>" + (p.process_path || p.process_name || "") + "</td><td>" + (p.connection_count || 0) + "</td><td>" + new Date(p.last_seen).toLocaleTimeString() + "</td></tr>";
+              }).join("");
+        }
       } catch (err) {
         document.getElementById("updated").textContent = "start collection with: bytepulse daemon";
       }

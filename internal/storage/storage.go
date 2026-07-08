@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -28,6 +29,26 @@ type SummaryResult struct {
 	RXBytes     uint64    `json:"rx_bytes"`
 	TXBytes     uint64    `json:"tx_bytes"`
 	DurationSec float64   `json:"duration_sec"`
+}
+
+type ProcessConnectionMinute struct {
+	MinuteStart        time.Time `json:"minute_start"`
+	PID                int       `json:"pid"`
+	ProcessName        string    `json:"process_name"`
+	ProcessPath        string    `json:"process_path"`
+	ProcessKey         string    `json:"process_key"`
+	MaxConnectionCount int       `json:"max_connection_count"`
+	SampleCount        int       `json:"sample_count"`
+	LastSeen           time.Time `json:"last_seen"`
+}
+
+type ProcessConnectionSummary struct {
+	PID             int       `json:"pid"`
+	ProcessName     string    `json:"process_name"`
+	ProcessPath     string    `json:"process_path"`
+	ProcessKey      string    `json:"process_key"`
+	ConnectionCount int       `json:"connection_count"`
+	LastSeen        time.Time `json:"last_seen"`
 }
 
 func (s SummaryResult) AvgRXBps() float64 {
@@ -105,8 +126,32 @@ func (s *Store) Migrate() error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts);
 		CREATE INDEX IF NOT EXISTS idx_samples_interface_ts ON samples(interface_name, ts);
+		CREATE TABLE IF NOT EXISTS process_connection_minutes (
+			minute_start INTEGER NOT NULL,
+			process_key TEXT NOT NULL,
+			pid INTEGER NOT NULL,
+			process_name TEXT NOT NULL,
+			process_path TEXT NOT NULL DEFAULT '',
+			max_connection_count INTEGER NOT NULL,
+			sample_count INTEGER NOT NULL,
+			last_seen INTEGER NOT NULL,
+			PRIMARY KEY (minute_start, process_key)
+		);
+		CREATE INDEX IF NOT EXISTS idx_pcm_minute ON process_connection_minutes(minute_start);
+		CREATE INDEX IF NOT EXISTS idx_pcm_process_minute ON process_connection_minutes(process_key, minute_start);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.ensureProcessPathColumn()
+}
+
+func (s *Store) ensureProcessPathColumn() error {
+	_, err := s.db.Exec(`ALTER TABLE process_connection_minutes ADD COLUMN process_path TEXT NOT NULL DEFAULT ''`)
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	return nil
 }
 
 func (s *Store) InsertSamples(samples []Sample) error {
@@ -148,10 +193,115 @@ func (s *Store) InsertSamples(samples []Sample) error {
 	return tx.Commit()
 }
 
-func (s *Store) Cleanup(now time.Time) error {
-	cutoff := now.Add(-15 * 24 * time.Hour)
+func (s *Store) Cleanup(now time.Time, retention time.Duration) error {
+	if retention <= 0 {
+		retention = 30 * 24 * time.Hour
+	}
+	cutoff := now.Add(-retention)
 	_, err := s.db.Exec(`DELETE FROM samples WHERE ts < ?`, toMillis(cutoff))
 	return err
+}
+
+func (s *Store) UpsertProcessConnectionMinutes(items []ProcessConnectionMinute) error {
+	if len(items) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO process_connection_minutes (
+			minute_start, process_key, pid, process_name, process_path, max_connection_count, sample_count, last_seen
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(minute_start, process_key) DO UPDATE SET
+			pid = excluded.pid,
+			process_name = excluded.process_name,
+			process_path = excluded.process_path,
+			max_connection_count = MAX(process_connection_minutes.max_connection_count, excluded.max_connection_count),
+			sample_count = process_connection_minutes.sample_count + excluded.sample_count,
+			last_seen = MAX(process_connection_minutes.last_seen, excluded.last_seen)
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, item := range items {
+		_, err := stmt.Exec(
+			toMillis(item.MinuteStart.Truncate(time.Minute)),
+			item.ProcessKey,
+			item.PID,
+			item.ProcessName,
+			item.ProcessPath,
+			item.MaxConnectionCount,
+			item.SampleCount,
+			toMillis(item.LastSeen),
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func (s *Store) CleanupProcessConnectionMinutes(now time.Time, retention time.Duration) error {
+	if retention <= 0 {
+		retention = 30 * 24 * time.Hour
+	}
+	cutoff := now.Add(-retention)
+	_, err := s.db.Exec(`DELETE FROM process_connection_minutes WHERE minute_start < ?`, toMillis(cutoff))
+	return err
+}
+
+func (s *Store) TopProcessConnectionMinutes(start, end time.Time, limit int) ([]ProcessConnectionSummary, error) {
+	if limit <= 0 {
+		limit = 30
+	}
+	rows, err := s.db.Query(`
+		SELECT
+			process_key,
+			pid,
+			process_name,
+			process_path,
+			COALESCE(SUM(sample_count), 0) AS connection_count,
+			COALESCE(MAX(last_seen), 0) AS last_seen,
+			COALESCE(MAX(max_connection_count), 0) AS max_connection_count
+		FROM process_connection_minutes
+		WHERE minute_start >= ? AND minute_start <= ?
+		GROUP BY process_key, pid, process_name, process_path
+		ORDER BY connection_count DESC, max_connection_count DESC, process_name ASC
+		LIMIT ?
+	`, toMillis(start.Truncate(time.Minute)), toMillis(end), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []ProcessConnectionSummary{}
+	for rows.Next() {
+		var lastSeen int64
+		var ignoredMax int
+		var item ProcessConnectionSummary
+		if err := rows.Scan(
+			&item.ProcessKey,
+			&item.PID,
+			&item.ProcessName,
+			&item.ProcessPath,
+			&item.ConnectionCount,
+			&lastSeen,
+			&ignoredMax,
+		); err != nil {
+			return nil, err
+		}
+		item.LastSeen = fromMillis(lastSeen)
+		out = append(out, item)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) LatestAggregateSample(interfaceName string) (Sample, error) {

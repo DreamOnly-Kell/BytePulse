@@ -22,11 +22,12 @@ type InterfaceCounter struct {
 type Options struct {
 	Interval  time.Duration
 	Interface string
+	Retention time.Duration
 }
 
 type Store interface {
 	InsertSamples([]storage.Sample) error
-	Cleanup(now time.Time) error
+	Cleanup(now time.Time, retention time.Duration) error
 }
 
 type Collector struct {
@@ -37,6 +38,9 @@ type Collector struct {
 func New(store Store, opts Options) *Collector {
 	if opts.Interval <= 0 {
 		opts.Interval = time.Second
+	}
+	if opts.Retention <= 0 {
+		opts.Retention = 30 * 24 * time.Hour
 	}
 	return &Collector{store: store, opts: opts}
 }
@@ -66,7 +70,7 @@ func (c *Collector) Run(ctx context.Context) error {
 				if err := c.store.InsertSamples(samples); err != nil {
 					return err
 				}
-				if err := c.store.Cleanup(now); err != nil {
+				if err := c.store.Cleanup(now, c.opts.Retention); err != nil {
 					return err
 				}
 			}

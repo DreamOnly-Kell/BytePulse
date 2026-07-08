@@ -13,8 +13,11 @@ BytePulse is a local network traffic monitor with CLI, TUI, and Web dashboards. 
 - Hourly and daily aggregation APIs.
 - CLI, TUI, and local Web dashboard.
 - Per-interface filtering with `--interface`.
+- Process connection discovery on macOS: process name, full process path, PID, connection count, and last seen time.
+- 1-second realtime process refresh through the daemon API for CLI, TUI, and Web.
 - Local SQLite storage.
 - No packet capture; BytePulse reads operating-system network counters.
+- No per-process RX/TX byte attribution yet.
 
 ## Platform Support
 
@@ -22,11 +25,11 @@ BytePulse is designed to be cross-platform. The current implementation uses Go a
 
 | Platform | Status |
 | --- | --- |
-| macOS | Tested |
-| Linux | Expected, not fully tested |
-| Windows | Expected, not fully tested |
+| macOS | Core monitoring tested; process connection discovery implemented |
+| Linux | Core monitoring expected; process connection discovery currently disabled |
+| Windows | Core monitoring expected; process connection discovery currently disabled |
 
-Per-process network usage is not implemented yet. When added, it will need platform-specific implementations for macOS, Linux, and Windows.
+Phase 2A process monitoring shows which processes have network connections. It does not yet attribute exact per-process traffic bytes or speeds; that requires platform-specific traffic attribution work. Linux and Windows process discovery are planned as platform-specific follow-ups.
 
 ## Build
 
@@ -111,6 +114,16 @@ Show a traffic report:
 ./bytepulse report --range 24h
 ```
 
+Show processes currently using the network:
+
+```bash
+./bytepulse processes
+./bytepulse processes --watch
+./bytepulse processes --range 24h
+```
+
+Process views show both `NAME` and `PATH`. `NAME` is the short executable name; `PATH` preserves the full process path when the platform provides it.
+
 List network interfaces:
 
 ```bash
@@ -163,6 +176,13 @@ Use a custom daemon PID file:
 ./bytepulse --pid-file ./bytepulse.pid stop
 ```
 
+Use a custom daemon API address:
+
+```bash
+./bytepulse --daemon-api-addr 127.0.0.1:8988 daemon
+./bytepulse --daemon-api-addr 127.0.0.1:8988 processes --watch
+```
+
 ## Resource Usage
 
 In tools such as `htop`, `VIRT` can be much larger than actual memory use. BytePulse is a Go program and uses SQLite; the process can reserve a large virtual address range without physically using that memory. Use `RES`/resident memory and sustained CPU usage to judge real resource cost.
@@ -177,7 +197,9 @@ Default database path:
 ~/.bytepulse/bytepulse.db
 ```
 
-BytePulse currently keeps up to 15 days of samples. The default collector interval is 1 second, but it can be changed with `daemon --interval`. Each sample stores timestamp, interface name, received bytes, transmitted bytes, receive speed, transmit speed, and sample interval.
+BytePulse keeps up to 30 days of samples by default. The default collector interval is 1 second, but it can be changed with `daemon --interval`. Each interface sample stores timestamp, interface name, received bytes, transmitted bytes, receive speed, transmit speed, and sample interval.
+
+Process connection monitoring also samples every 1 second, but it does not write raw per-second connection snapshots to SQLite. The daemon keeps the latest process connection state in memory for realtime views and flushes minute-level process rollups to SQLite for historical process reports.
 
 Rolling summaries include samples by their sample timestamp. With the default 1-second interval, boundary error is at most about one sample interval. Daily buckets are currently grouped by Unix day boundaries.
 
@@ -192,6 +214,8 @@ GET /api/ranges
 GET /api/hourly
 GET /api/daily
 GET /api/series
+GET /api/processes
+GET /api/processes/top?range=24h
 ```
 
 All API endpoints accept `?interface=<name>`. For example:
@@ -203,6 +227,15 @@ GET /api/summary?range=24h&interface=en0
 
 `/api/hourly` returns the latest 24 hours. `/api/daily` returns the latest 15 days.
 
+The daemon-local API also exposes:
+
+```text
+GET /api/health
+GET /api/processes?limit=30
+GET /api/processes/connections?process_key=<key>
+GET /api/processes/top?range=24h&limit=30
+```
+
 ## Roadmap
 
 - Configuration file support.
@@ -210,7 +243,8 @@ GET /api/summary?range=24h&interface=en0
 - CSV and JSON export.
 - macOS `launchd` service setup.
 - Minute/hour/day aggregate tables for lower long-term storage usage.
-- Per-process network usage view.
+- Linux and Windows process connection discovery.
+- Per-process traffic byte attribution as a separate future phase.
 - Desktop tray or widget integration.
 
 ## License

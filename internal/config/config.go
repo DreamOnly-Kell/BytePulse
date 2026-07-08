@@ -9,10 +9,14 @@ import (
 )
 
 type Config struct {
-	DBPath    string
-	PIDPath   string
-	Interface string
-	UseBits   bool
+	DBPath          string
+	PIDPath         string
+	Interface       string
+	UseBits         bool
+	Retention       time.Duration
+	TopN            int
+	ProcessInterval time.Duration
+	DaemonAPIAddr   string
 }
 
 func Default() Config {
@@ -22,8 +26,12 @@ func Default() Config {
 	}
 	stateDir := filepath.Join(home, ".bytepulse")
 	return Config{
-		DBPath:  filepath.Join(stateDir, "bytepulse.db"),
-		PIDPath: filepath.Join(stateDir, "bytepulse.pid"),
+		DBPath:          filepath.Join(stateDir, "bytepulse.db"),
+		PIDPath:         filepath.Join(stateDir, "bytepulse.pid"),
+		Retention:       30 * 24 * time.Hour,
+		TopN:            30,
+		ProcessInterval: time.Second,
+		DaemonAPIAddr:   "127.0.0.1:8988",
 	}
 }
 

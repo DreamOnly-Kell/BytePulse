@@ -13,8 +13,11 @@ BytePulse 是一个本地网络流量监控工具，提供 CLI、TUI 和本地 W
 - 支持每小时和每天聚合 API。
 - 提供 CLI、TUI 和本地 Web 仪表盘。
 - 支持通过 `--interface` 查看指定网卡。
+- macOS 支持进程连接发现：进程名、完整进程路径、PID、连接数和最后出现时间。
+- CLI、TUI、Web 的进程视图通过 daemon API 每 1 秒实时刷新。
 - 使用本地 SQLite 存储数据。
 - 不抓包，只读取操作系统网络计数器。
+- 当前不提供按进程 RX/TX 字节归因。
 
 ## 平台支持
 
@@ -22,11 +25,11 @@ BytePulse 设计目标是多平台支持。当前实现使用 Go 和 `gopsutil` 
 
 | 平台 | 状态 |
 | --- | --- |
-| macOS | 已验证 |
-| Linux | 预期支持，尚未完整验证 |
-| Windows | 预期支持，尚未完整验证 |
+| macOS | 核心监控已验证；已实现进程连接发现 |
+| Linux | 核心监控预期支持；进程连接发现当前禁用 |
+| Windows | 核心监控预期支持；进程连接发现当前禁用 |
 
-按进程统计网络流量的能力尚未实现。后续如果加入该功能，需要分别为 macOS、Linux 和 Windows 做平台适配。
+Phase 2A 的进程监控显示“哪些进程存在网络连接”。它还不提供精确的按进程流量字节数或速度；这需要平台专用的流量归因方案。Linux 和 Windows 的进程发现会作为后续平台适配实现。
 
 ## 构建
 
@@ -111,6 +114,16 @@ zip -j dist/bytepulse-windows-arm64.zip dist/bytepulse-windows-arm64.exe
 ./bytepulse report --range 24h
 ```
 
+查看当前联网进程：
+
+```bash
+./bytepulse processes
+./bytepulse processes --watch
+./bytepulse processes --range 24h
+```
+
+进程视图同时显示 `NAME` 和 `PATH`。`NAME` 是短进程名；`PATH` 在平台能提供时保留完整进程路径。
+
 列出网络接口：
 
 ```bash
@@ -163,6 +176,13 @@ http://127.0.0.1:8989
 ./bytepulse --pid-file ./bytepulse.pid stop
 ```
 
+指定 daemon API 地址：
+
+```bash
+./bytepulse --daemon-api-addr 127.0.0.1:8988 daemon
+./bytepulse --daemon-api-addr 127.0.0.1:8988 processes --watch
+```
+
 ## 资源占用
 
 在 `htop` 等工具中，`VIRT` 可能明显大于实际内存占用。BytePulse 是 Go 程序，并使用 SQLite；进程可能保留较大的虚拟地址空间，但这不代表实际占用了同等物理内存。判断真实资源占用时，应优先看 `RES` 常驻内存和持续 CPU 占用。
@@ -177,7 +197,9 @@ http://127.0.0.1:8989
 ~/.bytepulse/bytepulse.db
 ```
 
-当前版本保留最近 15 天的采样数据。默认采集间隔是 1 秒，也可以通过 `daemon --interval` 修改。每条采样包含时间戳、网卡名称、接收字节、发送字节、接收速度、发送速度和采样间隔。
+默认保留最近 30 天的采样数据。默认采集间隔是 1 秒，也可以通过 `daemon --interval` 修改。每条网卡采样包含时间戳、网卡名称、接收字节、发送字节、接收速度、发送速度和采样间隔。
+
+进程连接监控同样每 1 秒采样，但不会把每秒原始连接快照写入 SQLite。daemon 在内存中保存最新进程连接状态，供实时视图使用；SQLite 只保存分钟级进程连接聚合，供历史进程报表使用。
 
 滚动统计按采样时间戳归属样本。默认 1 秒间隔下，窗口边界误差最多约为一个采样间隔。每日聚合当前按 Unix 日边界分桶。
 
@@ -192,6 +214,8 @@ GET /api/ranges
 GET /api/hourly
 GET /api/daily
 GET /api/series
+GET /api/processes
+GET /api/processes/top?range=24h
 ```
 
 所有 API 都支持 `?interface=<name>`。例如：
@@ -203,6 +227,15 @@ GET /api/summary?range=24h&interface=en0
 
 `/api/hourly` 返回最近 24 小时。`/api/daily` 返回最近 15 天。
 
+daemon 本地 API 还提供：
+
+```text
+GET /api/health
+GET /api/processes?limit=30
+GET /api/processes/connections?process_key=<key>
+GET /api/processes/top?range=24h&limit=30
+```
+
 ## 后续计划
 
 - 支持配置文件。
@@ -210,7 +243,8 @@ GET /api/summary?range=24h&interface=en0
 - 支持 CSV 和 JSON 导出。
 - 支持 macOS `launchd` 后台服务安装。
 - 增加分钟、小时、天聚合表，降低长期存储占用。
-- 增加按进程查看网络流量的能力。
+- 增加 Linux 和 Windows 进程连接发现。
+- 按进程流量字节归因作为后续独立阶段。
 - 增加桌面托盘或桌面小组件。
 
 ## 协议
