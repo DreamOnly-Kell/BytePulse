@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"bytepulse/internal/config"
+	"bytepulse/internal/logx"
 	"bytepulse/internal/processstate"
 	"bytepulse/internal/storage"
 )
@@ -88,12 +89,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
 	limit, err := s.limit(r)
 	if err != nil {
+		logx.Debug("bad processes limit", "component", "daemonapi", "err", err, "remote", r.RemoteAddr)
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	// No method check: ServeMux only matches path; GET is assumed by clients.
 	// 未校验 method：ServeMux 只匹配路径；客户端约定 GET。
-	writeJSON(w, s.state.LatestSummaries(limit))
+	items := s.state.LatestSummaries(limit)
+	logx.Debug("api processes", "component", "daemonapi", "limit", limit, "rows", len(items), "remote", r.RemoteAddr)
+	writeJSON(w, items)
 }
 
 // handleProcessConnections returns socket details for ?process_key=.
@@ -101,10 +105,13 @@ func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleProcessConnections(w http.ResponseWriter, r *http.Request) {
 	processKey := r.URL.Query().Get("process_key")
 	if processKey == "" {
+		logx.Debug("missing process_key", "component", "daemonapi", "remote", r.RemoteAddr)
 		writeError(w, http.StatusBadRequest, fmt.Errorf("process_key is required"))
 		return
 	}
-	writeJSON(w, s.state.LatestConnections(processKey))
+	items := s.state.LatestConnections(processKey)
+	logx.Debug("api process connections", "component", "daemonapi", "process_key", processKey, "rows", len(items))
+	writeJSON(w, items)
 }
 
 // handleProcessesTop queries historical process ranks for a time range.
@@ -123,6 +130,7 @@ func (s *Server) handleProcessesTop(w http.ResponseWriter, r *http.Request) {
 	}
 	d, err := config.ParseRange(rangeText)
 	if err != nil {
+		logx.Debug("bad processes/top range", "component", "daemonapi", "range", rangeText, "err", err)
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -133,15 +141,18 @@ func (s *Server) handleProcessesTop(w http.ResponseWriter, r *http.Request) {
 	}
 	items, err := s.store.TopProcessConnectionMinutes(now.Add(-d), now, fetchLimit)
 	if err != nil {
+		logx.Error("processes/top query failed", "component", "daemonapi", "range", rangeText, "err", err)
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	// Drop historical bytepulse rows when exclude-self is enabled.
 	// 开启 exclude-self 时去掉历史中的 bytepulse 行。
+	before := len(items)
 	items = storage.FilterSelfSummaries(items, s.cfg.ExcludeSelf)
 	if limit > 0 && len(items) > limit {
 		items = items[:limit]
 	}
+	logx.Debug("api processes/top", "component", "daemonapi", "range", rangeText, "raw", before, "rows", len(items))
 	writeJSON(w, items)
 }
 

@@ -4,7 +4,9 @@ package collector
 
 import (
 	"context"
+	"errors"
 
+	"bytepulse/internal/logx"
 	"bytepulse/internal/processstate"
 	"bytepulse/internal/proctraffic"
 )
@@ -34,13 +36,37 @@ func (c *ProcessTrafficCollector) Run(ctx context.Context) error {
 	if c == nil || c.attributor == nil || c.state == nil {
 		return nil
 	}
+	logx.Info("process traffic collector started", "component", "proctraffic")
 	// Feed each batch of samples into shared process memory state.
 	// 将每批样本写入共享进程内存态。
-	// Note: attributor errors are currently discarded.
-	// 注意：attributor 错误当前被丢弃。
-	_ = c.attributor.Run(ctx, func(samples []proctraffic.Sample) {
+	err := c.attributor.Run(ctx, func(samples []proctraffic.Sample) {
+		if len(samples) == 0 {
+			logx.Debug("process traffic batch empty", "component", "proctraffic")
+			return
+		}
+		var maxRX, maxTX float64
+		for _, s := range samples {
+			if s.RXBps > maxRX {
+				maxRX = s.RXBps
+			}
+			if s.TXBps > maxTX {
+				maxTX = s.TXBps
+			}
+		}
+		logx.Debug("process traffic sample batch",
+			"component", "proctraffic",
+			"n", len(samples),
+			"max_rx_bps", maxRX,
+			"max_tx_bps", maxTX,
+			"source", samples[0].Source,
+		)
 		c.state.UpdateTraffic(trafficSamplesToState(samples))
 	})
+	if err != nil && !errors.Is(err, context.Canceled) {
+		logx.Warn("process traffic attributor stopped", "component", "proctraffic", "err", err)
+		return nil
+	}
+	logx.Info("process traffic collector stopped", "component", "proctraffic")
 	return nil
 }
 

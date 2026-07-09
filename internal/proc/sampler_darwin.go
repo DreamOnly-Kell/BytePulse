@@ -8,8 +8,9 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
+
+	"bytepulse/internal/logx"
 
 	gopsnet "github.com/shirou/gopsutil/v4/net"
 )
@@ -42,6 +43,7 @@ func (darwinSampler) Sample() ([]Connection, error) {
 	// "all" 请求带 PID 的 TCP+UDP（及相关）连接统计。
 	stats, err := gopsnet.Connections("all")
 	if err != nil {
+		logx.Debug("darwin Connections(all) failed", "component", "proc", "err", err)
 		return nil, err
 	}
 
@@ -52,10 +54,12 @@ func (darwinSampler) Sample() ([]Connection, error) {
 	// identities 避免对同一 PID 重复调用 `ps`。
 	identities := map[int]identity{}
 	out := make([]Connection, 0, len(stats))
+	skippedPID := 0
 	for _, stat := range stats {
 		// Skip kernel/unowned sockets without a PID.
 		// 跳过无 PID 的内核/无主套接字。
 		if stat.Pid <= 0 {
+			skippedPID++
 			continue
 		}
 		pid := int(stat.Pid)
@@ -91,6 +95,13 @@ func (darwinSampler) Sample() ([]Connection, error) {
 		seen[dkey] = true
 		out = append(out, conn)
 	}
+	logx.Debug("darwin connection sample",
+		"component", "proc",
+		"raw_stats", len(stats),
+		"skipped_no_pid", skippedPID,
+		"unique_conns", len(out),
+		"unique_pids", len(identities),
+	)
 	return out, nil
 }
 
@@ -130,22 +141,4 @@ func lookupCreateTime(pid int) int64 {
 		return 0
 	}
 	return start.UnixMilli()
-}
-
-// protocolName maps socket type (and optional status) to a short protocol label.
-// protocolName 将套接字类型（及可选状态）映射为短协议标签。
-func protocolName(socketType uint32, status string) string {
-	switch socketType {
-	case syscall.SOCK_STREAM:
-		return "tcp"
-	case syscall.SOCK_DGRAM:
-		return "udp"
-	default:
-		// Heuristic: presence of a TCP-like status string implies tcp.
-		// 启发式：存在类 TCP 状态字符串则视为 tcp。
-		if status != "" {
-			return "tcp"
-		}
-		return "udp"
-	}
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"time"
 
+	"bytepulse/internal/logx"
 	"bytepulse/internal/proc"
 	"bytepulse/internal/processstate"
 	"bytepulse/internal/storage"
@@ -82,14 +83,22 @@ func NewProcessConnectionCollector(
 // Run samples once immediately, then on each Interval until ctx ends.
 // Run 立即采样一次，之后每个 Interval 采样，直到 ctx 结束。
 func (c *ProcessConnectionCollector) Run(ctx context.Context) error {
+	logx.Info("process connection collector starting",
+		"component", "proc",
+		"interval", c.opts.Interval.String(),
+		"exclude_self", c.opts.ExcludeSelf,
+		"self_pid", c.opts.SelfPID,
+	)
 	// Prime memory state before waiting for the first tick.
 	// 在等待第一拍前先填充内存态。
 	if err := c.sampleOnce(time.Now()); err != nil {
 		// Unsupported platform: exit cleanly; interface collector keeps running.
 		// 不支持的平台：干净退出；网卡采集器继续运行。
 		if errors.Is(err, errProcessConnectionUnsupported) {
+			logx.Info("process connection sampling disabled", "component", "proc", "reason", "unsupported platform")
 			return nil
 		}
+		logx.Error("process connection sample failed at start", "component", "proc", "err", err)
 		return err
 	}
 
@@ -107,8 +116,10 @@ func (c *ProcessConnectionCollector) Run(ctx context.Context) error {
 				// Platform became unsupported mid-run (unlikely) → stop quietly.
 				// 运行中变为不支持（少见）→ 安静停止。
 				if errors.Is(err, errProcessConnectionUnsupported) {
+					logx.Info("process connection sampling disabled", "component", "proc", "reason", "unsupported platform")
 					return nil
 				}
+				logx.Error("process connection sample failed", "component", "proc", "err", err)
 				return err
 			}
 		}
@@ -124,14 +135,23 @@ func (c *ProcessConnectionCollector) sampleOnce(now time.Time) error {
 	if errors.Is(err, proc.ErrNotSupported) {
 		return errProcessConnectionUnsupported
 	}
-	// Other sampling errors are currently swallowed (state stays previous).
-	// 其它采样错误当前被吞掉（内存态保持为上一次）。
+	// Other sampling errors are swallowed but logged (state stays previous).
+	// 其它采样错误吞掉但记日志（内存态保持为上一次）。
 	if err != nil {
+		logx.WarnEvery(30*time.Second, "proc.sample", "process connection sample error", "component", "proc", "err", err)
 		return nil
 	}
+	rawN := len(conns)
 	// Optionally drop bytepulse / own PID before updating state and SQLite.
 	// 可选在更新内存态与 SQLite 前去掉 bytepulse / 自身 PID。
 	conns = proc.FilterSelfConnections(conns, c.opts.ExcludeSelf, c.opts.SelfPID)
+	logx.Debug("process connections sampled",
+		"component", "proc",
+		"raw", rawN,
+		"after_exclude", len(conns),
+		"exclude_self", c.opts.ExcludeSelf,
+		"self_pid", c.opts.SelfPID,
+	)
 	// Replace latest process/connection maps and update minute buckets.
 	// 替换最新进程/连接映射并更新分钟桶。
 	c.state.Update(conns, now)
@@ -158,11 +178,18 @@ func flushProcessMinutes(store ProcessConnectionStore, state *processstate.State
 	// Upsert merged stats for each (minute_start, process_key).
 	// 按 (minute_start, process_key) upsert 合并统计。
 	if err := store.UpsertProcessConnectionMinutes(items); err != nil {
+		logx.Error("flush process minutes failed", "component", "proc", "err", err, "rows", len(items))
 		return err
 	}
+	logx.Info("flushed process connection minutes", "component", "proc", "rows", len(items))
 	// Delete expired historical process minutes.
 	// 删除过期的历史进程分钟数据。
-	return store.CleanupProcessConnectionMinutes(now, retention)
+	if err := store.CleanupProcessConnectionMinutes(now, retention); err != nil {
+		logx.Error("cleanup process minutes failed", "component", "proc", "err", err)
+		return err
+	}
+	logx.Debug("process minutes cleanup ok", "component", "proc", "retention", retention.String())
+	return nil
 }
 
 // processMinuteToStorage maps in-memory minute rollup to the DB model.

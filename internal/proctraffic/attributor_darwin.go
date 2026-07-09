@@ -7,8 +7,28 @@ package proctraffic
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os/exec"
+
+	"bytepulse/internal/logx"
 )
+
+// NewAttributor selects a macOS traffic backend from mode.
+// NewAttributor 按 mode 选择 macOS 流量后端。
+// Supported: auto, on, nettop. estats is Windows-only.
+// 支持：auto、on、nettop。estats 仅 Windows。
+func NewAttributor(mode string) (Attributor, error) {
+	switch mode {
+	case "auto", "on", "nettop":
+		return NewNettopAttributor(), nil
+	case "estats":
+		return nil, fmt.Errorf("process traffic mode %q is only supported on Windows; use auto or nettop on macOS", mode)
+	case "off", "":
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("unsupported process traffic mode %q; use off, auto, or nettop", mode)
+	}
+}
 
 // nettopAttributor runs the system `nettop` binary and parses its CSV stream.
 // nettopAttributor 运行系统 `nettop` 二进制并解析其 CSV 流。
@@ -52,19 +72,23 @@ func (a nettopAttributor) Run(ctx context.Context, onSample func([]Sample)) erro
 	// 构建命令（或测试替身）。
 	cmd, err := a.command(ctx)
 	if err != nil {
+		logx.Error("nettop command build failed", "component", "proctraffic", "err", err)
 		return err
 	}
 	// Stream stdout into the CSV scanner.
 	// 将 stdout 流式交给 CSV 扫描器。
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		logx.Error("nettop stdout pipe failed", "component", "proctraffic", "err", err)
 		return err
 	}
 	// Start nettop asynchronously.
 	// 异步启动 nettop。
 	if err := cmd.Start(); err != nil {
+		logx.Error("nettop start failed", "component", "proctraffic", "err", err)
 		return err
 	}
+	logx.Info("nettop started", "component", "proctraffic", "args", nettopArgs())
 	// Parse until EOF/cancel; then wait for the child.
 	// 解析直到 EOF/取消；然后等待子进程。
 	err = scanNettopCSV(ctx, stdout, onSample)
@@ -72,12 +96,17 @@ func (a nettopAttributor) Run(ctx context.Context, onSample func([]Sample)) erro
 	// Context cancel is the normal shutdown path.
 	// Context 取消是正常关闭路径。
 	if errors.Is(ctx.Err(), context.Canceled) {
+		logx.Info("nettop stopped", "component", "proctraffic", "reason", "canceled")
 		return nil
 	}
 	// Prefer scan errors over wait errors when both exist.
 	// 两者都存在时优先返回扫描错误。
 	if err != nil {
+		logx.Warn("nettop scan ended with error", "component", "proctraffic", "err", err)
 		return err
+	}
+	if waitErr != nil {
+		logx.Warn("nettop process exit error", "component", "proctraffic", "err", waitErr)
 	}
 	return waitErr
 }

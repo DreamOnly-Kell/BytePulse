@@ -10,6 +10,7 @@ import (
 
 	"bytepulse/internal/config"
 	"bytepulse/internal/daemonclient"
+	"bytepulse/internal/i18n"
 	"bytepulse/internal/processstate"
 	"bytepulse/internal/storage"
 	"bytepulse/internal/units"
@@ -58,6 +59,12 @@ type model struct {
 	// processErr is set when the daemon API is unreachable.
 	// processErr 在 daemon API 不可达时设置。
 	processErr error
+	// daemonOK is true after a successful /api/health check.
+	// daemonOK 在 /api/health 成功后为 true。
+	daemonOK bool
+	// waitTicks counts seconds spent waiting for the daemon.
+	// waitTicks 统计等待 daemon 的秒数。
+	waitTicks int
 }
 
 // rangeStat pairs a range label with its SummaryResult.
@@ -115,10 +122,16 @@ func newModel(store *storage.Store, cfg config.Config) model {
 	}
 }
 
-// Init schedules the first one-second tick.
-// Init 调度第一次一秒 tick。
+// Init runs an immediate refresh, then schedules one-second ticks.
+// Without the immediate tick, the first frame always showed the wait screen
+// even when the daemon was already up (daemonOK starts false).
+// Init 立即刷新一次，再调度每秒 tick。
+// 若只有延迟 tick，首帧会因 daemonOK 默认为 false 而误显示等待屏。
 func (m model) Init() tea.Cmd {
-	return tick()
+	return tea.Batch(
+		func() tea.Msg { return tickMsg(time.Now()) },
+		tick(),
+	)
 }
 
 // Update handles keys, resize, and periodic refresh ticks.
@@ -153,6 +166,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // refresh loads interface stats from SQLite and processes from the daemon API.
 // refresh 从 SQLite 加载网卡统计，从 daemon API 加载进程。
 func (m *model) refresh() {
+	// Probe daemon health every tick until it is up (then keep probing lightly).
+	// 每拍探测 daemon health，起来之后仍会每拍检查。
+	if m.processClient != nil {
+		if err := m.processClient.Health(context.Background()); err != nil {
+			m.daemonOK = false
+			m.processErr = err
+			m.procs = nil
+			m.waitTicks++
+		} else {
+			if !m.daemonOK {
+				m.waitTicks = 0
+			}
+			m.daemonOK = true
+			m.processErr = nil
+		}
+	}
+
+	// While daemon is down, stay on the wait screen (still allow quit).
+	// daemon 未启动时停留在等待屏（仍可退出）。
+	if !m.daemonOK {
+		return
+	}
+
 	// Clear previous interface error each tick.
 	// 每拍清除上一次网卡错误。
 	m.err = nil
@@ -192,13 +228,14 @@ func (m *model) refresh() {
 	}
 	m.series = series
 
-	// Process list is best-effort; failure only affects the process view.
-	// 进程列表尽力而为；失败只影响进程视图。
+	// Process list from daemon API.
+	// 从 daemon API 拉进程列表。
 	if m.processClient != nil {
 		procs, err := m.processClient.Processes(context.Background(), m.cfg.TopN)
 		if err != nil {
 			m.procs = nil
 			m.processErr = err
+			m.daemonOK = false
 		} else {
 			m.procs = procs
 			m.processErr = nil
@@ -209,6 +246,12 @@ func (m *model) refresh() {
 // View renders either the process table or the main traffic dashboard.
 // View 渲染进程表或主流量看板。
 func (m model) View() string {
+	// Full-screen wait until background collector is healthy.
+	// 后台采集就绪前全屏等待。
+	if !m.daemonOK {
+		return m.waitDaemonView()
+	}
+
 	if m.showProc {
 		return m.processView()
 	}
@@ -216,23 +259,25 @@ func (m model) View() string {
 	var b strings.Builder
 	// Title + current interface filter label.
 	// 标题 + 当前网卡过滤标签。
-	b.WriteString(titleStyle.Render("BytePulse"))
+	b.WriteString(titleStyle.Render(i18n.T("tui.wait.title")))
 	b.WriteString("  ")
 	b.WriteString(labelStyle.Render(config.InterfaceLabel(m.cfg.Interface)))
 	b.WriteString("\n\n")
 
-	// Empty-database / missing daemon collection guidance.
-	// 空库 / 未启动采集时的引导。
+	// Empty-database guidance (daemon is up but no samples yet).
+	// 空库引导（daemon 已起但尚无样本）。
 	if m.err != nil {
-		b.WriteString(errorStyle.Render(fmt.Sprintf("No data: %v", m.err)))
-		b.WriteString("\n\nStart collection in another terminal with: bytepulse daemon\n")
-		b.WriteString("\nq: quit\n")
+		b.WriteString(errorStyle.Render(i18n.Tf("tui.main.no_samples", map[string]string{"err": m.err.Error()})))
+		b.WriteString("\n\n")
+		b.WriteString(i18n.T("tui.main.wait_samples"))
+		b.WriteString("\n\nq: quit\n")
 		return b.String()
 	}
 	// Before the first successful tick completes.
 	// 首次成功 tick 完成前。
 	if !m.loaded {
-		b.WriteString("Loading...\n")
+		b.WriteString(i18n.T("tui.main.loading"))
+		b.WriteString("\n")
 		return b.String()
 	}
 
@@ -240,13 +285,37 @@ func (m model) View() string {
 	// 实时速率、sparkline、多窗口总量、帮助页脚。
 	b.WriteString(renderRates(m.latest, m.cfg.UseBits))
 	b.WriteString("\n\n")
-	b.WriteString(labelStyle.Render("Last 60 seconds"))
+	b.WriteString(labelStyle.Render(i18n.T("tui.main.last60")))
 	b.WriteString("\n")
 	b.WriteString(renderBars(m.series, max(20, m.width-4)))
 	b.WriteString("\n\n")
 	b.WriteString(renderRanges(m.ranges, m.cfg.UseBits))
 	b.WriteString("\n")
-	b.WriteString(labelStyle.Render("tab: switch view | q: quit"))
+	b.WriteString(labelStyle.Render(i18n.T("tui.main.footer")))
+	b.WriteString("\n")
+	return b.String()
+}
+
+// waitDaemonView asks the user to start the background collector and keeps polling.
+// waitDaemonView 提示用户启动后台采集，并持续轮询。
+func (m model) waitDaemonView() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render(i18n.T("tui.wait.title")))
+	b.WriteString("\n\n")
+	b.WriteString(errorStyle.Render(i18n.T("tui.wait.headline")))
+	b.WriteString("\n\n")
+	b.WriteString(i18n.T("tui.wait.need_api"))
+	b.WriteString("\n")
+	b.WriteString(fmt.Sprintf("  %s\n\n", m.cfg.DaemonAPIAddr))
+	b.WriteString(i18n.T("tui.wait.start_other"))
+	b.WriteString("\n")
+	b.WriteString(valueStyle.Render("  " + config.DaemonStartHint(m.cfg)))
+	b.WriteString("\n\n")
+	b.WriteString(labelStyle.Render(i18n.Tf("tui.wait.waiting", map[string]string{
+		"seconds": fmt.Sprintf("%d", m.waitTicks),
+	})))
+	b.WriteString("\n")
+	b.WriteString(labelStyle.Render(i18n.T("tui.wait.footer")))
 	b.WriteString("\n")
 	return b.String()
 }
@@ -255,29 +324,35 @@ func (m model) View() string {
 // processView 渲染 Tab 进程连接表。
 func (m model) processView() string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("BytePulse [Processes]"))
+	b.WriteString(titleStyle.Render(i18n.T("tui.proc.title")))
 	b.WriteString("\n\n")
-	// Daemon must be running for realtime process data.
-	// 实时进程数据需要 daemon 正在运行。
+	// Should be rare: health passed then processes failed mid-session.
+	// 少见：health 通过后 processes 中途失败。
 	if m.processErr != nil {
-		b.WriteString(errorStyle.Render("Daemon API unavailable. Start bytepulse daemon."))
+		b.WriteString(errorStyle.Render(i18n.T("tui.proc.api_error")))
+		b.WriteString("\n")
+		b.WriteString(labelStyle.Render(i18n.Tf("tui.proc.start", map[string]string{"cmd": config.DaemonStartHint(m.cfg)})))
 		b.WriteString("\n\n")
-		b.WriteString(labelStyle.Render("tab: switch view | q: quit"))
+		b.WriteString(labelStyle.Render(i18n.T("tui.main.footer")))
 		b.WriteString("\n")
 		return b.String()
 	}
 	// No rows yet (sampler still warming up or unsupported platform).
 	// 尚无行（采样器预热中或不支持的平台）。
 	if len(m.procs) == 0 {
-		b.WriteString("Waiting for process connection data...\n\n")
-		b.WriteString(labelStyle.Render("tab: switch view | q: quit"))
+		b.WriteString(i18n.T("tui.proc.waiting_data"))
+		b.WriteString("\n\n")
+		b.WriteString(labelStyle.Render(i18n.T("tui.main.footer")))
 		b.WriteString("\n")
 		return b.String()
 	}
 	// PATH column grows with terminal width.
 	// PATH 列随终端宽度增长。
 	pathWidth := max(16, m.width-74)
-	b.WriteString(fmt.Sprintf("%-7s %-16s %-6s %-11s %-11s %-8s %s\n", "PID", "NAME", "CONNS", "RX/s", "TX/s", "LAST", "PATH"))
+	// Keep fixed English column keys for width; labels via i18n header string.
+	// 列宽仍按固定格式；表头整行走 i18n。
+	b.WriteString(i18n.T("tui.proc.header"))
+	b.WriteString("\n")
 	for _, item := range m.procs {
 		b.WriteString(fmt.Sprintf("%-7d %-16s %-6d %-11s %-11s %-8s %s\n",
 			item.PID,
@@ -292,7 +367,7 @@ func (m model) processView() string {
 		))
 	}
 	b.WriteString("\n")
-	b.WriteString(labelStyle.Render("tab: switch view | q: quit"))
+	b.WriteString(labelStyle.Render(i18n.T("tui.main.footer")))
 	b.WriteString("\n")
 	return b.String()
 }
@@ -319,10 +394,10 @@ func formatOptionalRate(rate float64, ok bool, bits bool) string {
 // renderRates 格式化下载/上传/总计/更新时间行。
 func renderRates(sample storage.Sample, bits bool) string {
 	rows := []string{
-		fmt.Sprintf("%-10s %s", "Download", valueStyle.Render(units.FormatRate(sample.RXSpeedBps, bits))),
-		fmt.Sprintf("%-10s %s", "Upload", valueStyle.Render(units.FormatRate(sample.TXSpeedBps, bits))),
-		fmt.Sprintf("%-10s %s", "Total", valueStyle.Render(units.FormatRate(sample.RXSpeedBps+sample.TXSpeedBps, bits))),
-		fmt.Sprintf("%-10s %s", "Updated", sample.Timestamp.Local().Format("15:04:05")),
+		fmt.Sprintf("%-10s %s", i18n.T("tui.rate.download"), valueStyle.Render(units.FormatRate(sample.RXSpeedBps, bits))),
+		fmt.Sprintf("%-10s %s", i18n.T("tui.rate.upload"), valueStyle.Render(units.FormatRate(sample.TXSpeedBps, bits))),
+		fmt.Sprintf("%-10s %s", i18n.T("tui.rate.total"), valueStyle.Render(units.FormatRate(sample.RXSpeedBps+sample.TXSpeedBps, bits))),
+		fmt.Sprintf("%-10s %s", i18n.T("tui.rate.updated"), sample.Timestamp.Local().Format("15:04:05")),
 	}
 	return strings.Join(rows, "\n")
 }
@@ -331,12 +406,14 @@ func renderRates(sample storage.Sample, bits bool) string {
 // renderRanges 打印多窗口流量总量与平均速率。
 func renderRanges(stats []rangeStat, bits bool) string {
 	var b strings.Builder
-	b.WriteString(labelStyle.Render("Traffic windows"))
+	b.WriteString(labelStyle.Render(i18n.T("tui.main.windows")))
 	b.WriteString("\n")
 	for _, stat := range stats {
 		total := stat.Summary.RXBytes + stat.Summary.TXBytes
+		// Keep short en/zh-neutral tokens down/up/total/avg for column scanability.
+		// 保留 down/up/total/avg 短词便于扫列（中英界面共用）。
 		b.WriteString(fmt.Sprintf(
-			"%-4s down %-10s up %-10s total %-10s avg %s\n",
+			"%-4s ↓ %-10s ↑ %-10s Σ %-10s avg %s\n",
 			stat.Label,
 			units.FormatBytes(stat.Summary.RXBytes),
 			units.FormatBytes(stat.Summary.TXBytes),

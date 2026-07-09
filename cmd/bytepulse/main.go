@@ -16,6 +16,8 @@ import (
 	"bytepulse/internal/config"
 	"bytepulse/internal/daemonapi"
 	"bytepulse/internal/daemonclient"
+	"bytepulse/internal/i18n"
+	"bytepulse/internal/logx"
 	"bytepulse/internal/proc"
 	"bytepulse/internal/processstate"
 	"bytepulse/internal/proctraffic"
@@ -33,6 +35,7 @@ func main() {
 	// Execute the Cobra command tree; print any error to stderr.
 	// 执行 Cobra 命令树；将错误打印到 stderr。
 	if err := newRootCommand().Execute(); err != nil {
+		logx.Error("command failed", "err", err)
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -41,29 +44,62 @@ func main() {
 // newRootCommand builds the root command, global flags, and subcommands.
 // newRootCommand 构建根命令、全局 flag 与子命令。
 func newRootCommand() *cobra.Command {
-	// Start from package defaults (~/.bytepulse paths, etc.).
-	// 从包内默认值起步（~/.bytepulse 路径等）。
+	// Defaults < config file < CLI flags (file loaded before flag registration).
+	// 默认值 < 配置文件 < CLI flag（注册 flag 前加载文件）。
 	cfg := config.Default()
+	configFlag := config.PeekConfigPath(os.Args[1:])
+	configPath := config.ResolveConfigPath(configFlag)
+	if configPath != "" {
+		if err := config.LoadFile(configPath, &cfg); err != nil {
+			// Fail early with a clear message before Cobra runs.
+			// Cobra 运行前用清晰错误直接失败。
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		cfg.ConfigPath = configPath
+	}
 
 	// Root command metadata shown in help.
 	// 帮助信息中展示的根命令元数据。
 	cmd := &cobra.Command{
 		Use:   "bytepulse",
-		Short: "Monitor local network traffic",
+		Short: "Monitor local network traffic / 监控本机网络流量",
+		// PersistentPreRunE initializes logging and UI language after flags are parsed.
+		// PersistentPreRunE 在 flag 解析后初始化日志与界面语言。
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			i18n.SetLang(cfg.Lang)
+			if err := logx.Init(logx.Options{
+				Level:  cfg.LogLevel,
+				Format: cfg.LogFormat,
+				File:   cfg.LogFile,
+			}); err != nil {
+				return err
+			}
+			if cfg.ConfigPath != "" {
+				logx.Info("config loaded", "component", "config", "path", cfg.ConfigPath)
+			}
+			logx.Debug("ui language", "component", "i18n", "lang", i18n.Lang())
+			return nil
+		},
 	}
 
-	// Persistent flags apply to all subcommands.
-	// Persistent flags 对所有子命令生效。
-	cmd.PersistentFlags().StringVar(&cfg.DBPath, "db", cfg.DBPath, "SQLite database path")
-	cmd.PersistentFlags().StringVar(&cfg.PIDPath, "pid-file", cfg.PIDPath, "daemon PID file path")
-	cmd.PersistentFlags().StringVar(&cfg.Interface, "interface", "", "interface name to query; empty means all non-loopback interfaces")
-	cmd.PersistentFlags().BoolVar(&cfg.UseBits, "bits", false, "display rates as bits/s instead of bytes/s")
-	cmd.PersistentFlags().DurationVar(&cfg.Retention, "retention", cfg.Retention, "data retention period")
-	cmd.PersistentFlags().IntVar(&cfg.TopN, "top-n", cfg.TopN, "default number of rows for process views")
-	cmd.PersistentFlags().DurationVar(&cfg.ProcessInterval, "process-interval", cfg.ProcessInterval, "process connection sampling interval")
-	cmd.PersistentFlags().StringVar(&cfg.DaemonAPIAddr, "daemon-api-addr", cfg.DaemonAPIAddr, "daemon local API address")
-	cmd.PersistentFlags().StringVar(&cfg.ProcessTraffic, "process-traffic", cfg.ProcessTraffic, "process traffic attribution mode: off, nettop")
-	cmd.PersistentFlags().BoolVar(&cfg.ExcludeSelf, "exclude-self", cfg.ExcludeSelf, "hide bytepulse itself from process views (default true)")
+	// Persistent flags apply to all subcommands (defaults already include file values).
+	// Persistent flags 对所有子命令生效（默认值已含配置文件）。
+	cmd.PersistentFlags().StringVar(&configFlag, "config", configFlag, "config file path (YAML); default ~/.bytepulse/config.yaml if present / 配置文件路径，默认存在则读 ~/.bytepulse/config.yaml")
+	cmd.PersistentFlags().StringVar(&cfg.DBPath, "db", cfg.DBPath, "SQLite database path / SQLite 数据库路径")
+	cmd.PersistentFlags().StringVar(&cfg.PIDPath, "pid-file", cfg.PIDPath, "daemon PID file path / daemon PID 文件路径")
+	cmd.PersistentFlags().StringVar(&cfg.Interface, "interface", cfg.Interface, "interface name; empty = all non-loopback / 网卡名，空=全部非回环")
+	cmd.PersistentFlags().BoolVar(&cfg.UseBits, "bits", cfg.UseBits, "display rates as bits/s / 速率以 bits/s 显示")
+	cmd.PersistentFlags().DurationVar(&cfg.Retention, "retention", cfg.Retention, "data retention period / 数据保留时长")
+	cmd.PersistentFlags().IntVar(&cfg.TopN, "top-n", cfg.TopN, "default process list rows / 进程列表默认行数")
+	cmd.PersistentFlags().DurationVar(&cfg.ProcessInterval, "process-interval", cfg.ProcessInterval, "process connection sampling interval / 进程连接采样间隔")
+	cmd.PersistentFlags().StringVar(&cfg.DaemonAPIAddr, "daemon-api-addr", cfg.DaemonAPIAddr, "daemon local API address / daemon 本机 API 地址")
+	cmd.PersistentFlags().StringVar(&cfg.ProcessTraffic, "process-traffic", cfg.ProcessTraffic, "process traffic: off, auto, nettop (macOS), estats (Windows) / 进程流量模式")
+	cmd.PersistentFlags().BoolVar(&cfg.ExcludeSelf, "exclude-self", cfg.ExcludeSelf, "hide bytepulse from process views / 进程视图中隐藏自身")
+	cmd.PersistentFlags().StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "log level: debug, info, warn, error (default error; logs always English) / 日志级别（日志内容固定英文）")
+	cmd.PersistentFlags().StringVar(&cfg.LogFormat, "log-format", cfg.LogFormat, "log format: text or json / 日志格式")
+	cmd.PersistentFlags().StringVar(&cfg.LogFile, "log-file", cfg.LogFile, "log file path; empty = stderr / 日志文件，空=stderr")
+	cmd.PersistentFlags().StringVar(&cfg.Lang, "lang", cfg.Lang, "UI language: en or zh (TUI/Web/CLI prompts; not logs) / 界面语言 en|zh（不含日志）")
 
 	// Register each user-facing subcommand.
 	// 注册各面向用户的子命令。
@@ -86,11 +122,13 @@ func openStore(cfg *config.Config) (*storage.Store, error) {
 	// 打开（或创建）数据库文件。
 	store, err := storage.Open(cfg.DBPath)
 	if err != nil {
+		logx.Error("open database failed", "component", "storage", "path", cfg.DBPath, "err", err)
 		return nil, err
 	}
 	// Apply CREATE TABLE / PRAGMA / column upgrades.
 	// 执行 CREATE TABLE / PRAGMA / 列升级。
 	if err := store.Migrate(); err != nil {
+		logx.Error("database migrate failed", "component", "storage", "path", cfg.DBPath, "err", err)
 		// Close on migrate failure to avoid leaking the handle.
 		// 迁移失败时关闭连接，避免句柄泄漏。
 		_ = store.Close()
@@ -102,22 +140,34 @@ func openStore(cfg *config.Config) (*storage.Store, error) {
 // newDaemonCommand starts collectors, process sampling, and the local API.
 // newDaemonCommand 启动采集器、进程采样与本机 API。
 func newDaemonCommand(cfg *config.Config) *cobra.Command {
-	// Interface sampling interval (flag-local; process interval is global).
-	// 网卡采样间隔（本命令 flag；进程间隔为全局 flag）。
-	var interval time.Duration
+	// Interface sampling interval (defaults from config file / Default).
+	// 网卡采样间隔（默认来自配置文件 / Default）。
+	interval := cfg.DaemonInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
 
 	cmd := &cobra.Command{
 		Use:   "daemon",
-		Short: "Collect network traffic every second",
+		Short: "Collect network traffic every second / 每秒采集网络流量",
+		// Avoid dumping full flag help on runtime errors (e.g. already running).
+		// 运行时错误（如已有实例）时不刷完整 flag 帮助。
+		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Record our PID so `bytepulse stop` can signal us.
-			// 记录自身 PID，便于 `bytepulse stop` 发信号。
-			if err := writePIDFile(cfg.PIDPath); err != nil {
+			// Single-instance: exclusive PID lock + refuse if API already healthy.
+			// 单实例：PID 排他锁；若 API 已健康则拒绝第二个 daemon。
+			inst, err := acquireDaemonInstance(cfg.PIDPath, cfg.DaemonAPIAddr)
+			if err != nil {
+				logx.Error("daemon already running or lock failed", "component", "daemon", "path", cfg.PIDPath, "api", cfg.DaemonAPIAddr, "err", err)
 				return err
 			}
-			// Always remove the PID file on exit (success or failure).
-			// 退出时始终删除 PID 文件（成功或失败）。
-			defer removePIDFile(cfg.PIDPath)
+			// Always unlock and remove the PID file on exit (success or failure).
+			// 退出时始终解锁并删除 PID 文件（成功或失败）。
+			defer func() {
+				if err := inst.Release(); err != nil {
+					logx.Warn("release daemon lock failed", "component", "daemon", "path", cfg.PIDPath, "err", err)
+				}
+			}()
 
 			// Open shared SQLite store for interface + process minute data.
 			// 打开共享 SQLite，供网卡样本与进程分钟数据使用。
@@ -126,6 +176,7 @@ func newDaemonCommand(cfg *config.Config) *cobra.Command {
 				return err
 			}
 			defer store.Close()
+			logx.Info("database ready", "component", "storage", "path", cfg.DBPath)
 
 			// Cancel on Ctrl+C / SIGTERM.
 			// 在 Ctrl+C / SIGTERM 时取消。
@@ -166,10 +217,12 @@ func newDaemonCommand(cfg *config.Config) *cobra.Command {
 				Addr:    cfg.DaemonAPIAddr,
 				Handler: api.Handler(),
 			}
-			// Only "off" and "nettop" are valid process-traffic modes.
-			// process-traffic 仅允许 "off" 与 "nettop"。
-			if cfg.ProcessTraffic != "off" && cfg.ProcessTraffic != "nettop" {
-				return fmt.Errorf("unsupported process traffic mode %q; use off or nettop", cfg.ProcessTraffic)
+			// Resolve optional per-process traffic backend (platform-specific).
+			// 解析可选的每进程流量后端（平台相关）。
+			trafficAttr, err := proctraffic.NewAttributor(cfg.ProcessTraffic)
+			if err != nil {
+				logx.Error("invalid process traffic mode", "component", "proctraffic", "mode", cfg.ProcessTraffic, "err", err)
+				return err
 			}
 
 			// Buffered error channel from background workers (API + collectors).
@@ -178,6 +231,7 @@ func newDaemonCommand(cfg *config.Config) *cobra.Command {
 			// Serve the daemon API until shutdown.
 			// 提供 daemon API 直到关闭。
 			go func() {
+				logx.Info("daemon API listening", "component", "daemonapi", "addr", cfg.DaemonAPIAddr)
 				if err := apiServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 					errCh <- fmt.Errorf("daemon API: %w", err)
 				}
@@ -196,21 +250,35 @@ func newDaemonCommand(cfg *config.Config) *cobra.Command {
 					errCh <- fmt.Errorf("process collector: %w", err)
 				}
 			}()
-			// Optionally start macOS nettop-based per-process rates.
-			// 可选启动基于 macOS nettop 的每进程速率。
-			if cfg.ProcessTraffic == "nettop" {
-				pt := collector.NewProcessTrafficCollector(proctraffic.NewNettopAttributor(), procState)
+			// Optional per-process RX/TX: nettop on macOS, TCP ESTATS on Windows.
+			// 可选每进程 RX/TX：macOS 为 nettop，Windows 为 TCP ESTATS。
+			if trafficAttr != nil {
+				logx.Info("process traffic enabled", "component", "proctraffic", "mode", cfg.ProcessTraffic)
+				pt := collector.NewProcessTrafficCollector(trafficAttr, procState)
 				go func() {
 					if err := pt.Run(runCtx); err != nil {
 						errCh <- fmt.Errorf("process traffic collector: %w", err)
 					}
 				}()
+			} else {
+				logx.Info("process traffic disabled", "component", "proctraffic", "mode", cfg.ProcessTraffic)
 			}
 
-			// Announce startup configuration on stdout.
-			// 在 stdout 打印启动配置。
+			// Announce startup configuration on stdout + structured log.
+			// 在 stdout 与结构化日志中公布启动配置。
 			fmt.Printf("bytepulse daemon started, db=%s, interval=%s, process_interval=%s, process_traffic=%s, api=http://%s\n",
 				cfg.DBPath, interval, cfg.ProcessInterval, cfg.ProcessTraffic, cfg.DaemonAPIAddr)
+			logx.Info("daemon started",
+				"component", "daemon",
+				"db", cfg.DBPath,
+				"interval", interval.String(),
+				"process_interval", cfg.ProcessInterval.String(),
+				"process_traffic", cfg.ProcessTraffic,
+				"exclude_self", cfg.ExcludeSelf,
+				"api", cfg.DaemonAPIAddr,
+				"log_level", cfg.LogLevel,
+				"log_file", cfg.LogFile,
+			)
 			// Wait for signal shutdown or a worker failure.
 			// 等待信号关闭或某个 worker 失败。
 			select {
@@ -218,6 +286,7 @@ func newDaemonCommand(cfg *config.Config) *cobra.Command {
 				// Cooperative stop of collectors.
 				// 协作式停止采集器。
 				cancel()
+				logx.Info("daemon shutting down", "component", "daemon", "reason", "signal")
 				// Give HTTP server a short window to drain.
 				// 给 HTTP 服务短暂时间排空连接。
 				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -227,6 +296,7 @@ func newDaemonCommand(cfg *config.Config) *cobra.Command {
 			case err := <-errCh:
 				// Propagate the first worker error after cleanup.
 				// 清理后向上返回第一个 worker 错误。
+				logx.Error("daemon worker failed", "component", "daemon", "err", err)
 				cancel()
 				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
 				defer shutdownCancel()
@@ -238,7 +308,7 @@ func newDaemonCommand(cfg *config.Config) *cobra.Command {
 
 	// Default interface sample interval is 1 second.
 	// 默认网卡采样间隔为 1 秒。
-	cmd.Flags().DurationVar(&interval, "interval", time.Second, "sampling interval")
+	cmd.Flags().DurationVar(&interval, "interval", interval, "sampling interval / 采样间隔")
 	return cmd
 }
 
@@ -253,7 +323,7 @@ func newProcessesCommand(cfg *config.Config) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "processes",
-		Short: "Show processes currently using the network",
+		Short: "Show processes using the network / 显示联网进程",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Fall back to global TopN when limit is unset/invalid.
 			// limit 未设/无效时回退到全局 TopN。
@@ -268,6 +338,7 @@ func newProcessesCommand(cfg *config.Config) *cobra.Command {
 			// Realtime path requires the daemon local API.
 			// 实时路径需要 daemon 本机 API。
 			client := daemonclient.New(cfg.DaemonAPIAddr)
+			logx.Debug("processes command", "component", "cli", "watch", watch, "limit", limit, "api", cfg.DaemonAPIAddr)
 			if watch {
 				// Refresh once per second like a simple top-style view.
 				// 每秒刷新一次，类似简易 top 视图。
@@ -279,7 +350,8 @@ func newProcessesCommand(cfg *config.Config) *cobra.Command {
 					fmt.Print("\033[H\033[2J")
 					// Print current snapshot; keep looping even if API is down.
 					// 打印当前快照；API 不可用时也继续循环。
-					if err := printRealtimeProcesses(cmd.Context(), client, limit, cfg.UseBits); err != nil {
+					if err := printRealtimeProcesses(cmd.Context(), client, limit, cfg.UseBits, cfg); err != nil {
+						logx.WarnEvery(30*time.Second, "cli.processes.watch", "realtime processes failed", "component", "cli", "err", err)
 						fmt.Println(err)
 					}
 					select {
@@ -295,27 +367,41 @@ func newProcessesCommand(cfg *config.Config) *cobra.Command {
 			}
 			// One-shot realtime dump.
 			// 单次实时输出。
-			return printRealtimeProcesses(cmd.Context(), client, limit, cfg.UseBits)
+			return printRealtimeProcesses(cmd.Context(), client, limit, cfg.UseBits, cfg)
 		},
 	}
 
-	cmd.Flags().IntVar(&limit, "limit", cfg.TopN, "number of process rows to show")
-	cmd.Flags().StringVar(&rangeText, "range", "", "historical range: 1h,2h,3h,5h,10h,12h,24h,2d,3d,7d,15d")
-	cmd.Flags().BoolVar(&watch, "watch", false, "refresh realtime process view every second")
+	cmd.Flags().IntVar(&limit, "limit", cfg.TopN, "number of process rows / 进程行数")
+	cmd.Flags().StringVar(&rangeText, "range", "", "historical range / 历史范围: 1h,2h,...,15d")
+	cmd.Flags().BoolVar(&watch, "watch", false, "refresh every second / 每秒刷新")
 	return cmd
 }
 
 // printRealtimeProcesses fetches process summaries from the daemon API.
 // printRealtimeProcesses 从 daemon API 拉取进程摘要。
-func printRealtimeProcesses(ctx context.Context, client *daemonclient.Client, limit int, bits bool) error {
+func printRealtimeProcesses(ctx context.Context, client *daemonclient.Client, limit int, bits bool, cfg *config.Config) error {
+	// Prefer health check for a clearer offline message.
+	// 优先 health 检查以给出更清晰的离线提示。
+	if err := client.Health(ctx); err != nil {
+		logx.Debug("daemon health failed", "component", "cli", "err", err)
+		hint := config.DaemonStartHint(*cfg)
+		return fmt.Errorf("%s", i18n.Tf("cli.daemon_down", map[string]string{
+			"api": cfg.DaemonAPIAddr,
+			"cmd": hint,
+		}))
+	}
 	// Query GET /api/processes.
 	// 请求 GET /api/processes。
 	items, err := client.Processes(ctx, limit)
 	if err != nil {
-		// Guide the user to start the daemon when the API is unreachable.
-		// API 不可达时引导用户启动 daemon。
-		return fmt.Errorf("daemon API unavailable; start it with: bytepulse daemon")
+		logx.Debug("daemon processes API call failed", "component", "cli", "err", err, "limit", limit)
+		hint := config.DaemonStartHint(*cfg)
+		return fmt.Errorf("%s", i18n.Tf("cli.daemon_err", map[string]string{
+			"err": err.Error(),
+			"cmd": hint,
+		}))
 	}
+	logx.Debug("realtime processes fetched", "component", "cli", "rows", len(items), "limit", limit)
 	printProcessRows(items, bits)
 	return nil
 }
@@ -346,12 +432,15 @@ func printHistoricalProcesses(cfg *config.Config, rangeText string, limit int) e
 	// 按分钟聚合统计排序进程（语义见 storage 包）。
 	items, err := store.TopProcessConnectionMinutes(now.Add(-d), now, fetchLimit)
 	if err != nil {
+		logx.Error("historical processes query failed", "component", "cli", "range", rangeText, "err", err)
 		return err
 	}
+	before := len(items)
 	items = storage.FilterSelfSummaries(items, cfg.ExcludeSelf)
 	if limit > 0 && len(items) > limit {
 		items = items[:limit]
 	}
+	logx.Info("historical processes query", "component", "cli", "range", rangeText, "raw_rows", before, "rows", len(items), "exclude_self", cfg.ExcludeSelf)
 	printStorageProcessRows(items)
 	return nil
 }
@@ -447,26 +536,31 @@ func truncateText(text string, width int) string {
 func newStopCommand(cfg *config.Config) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "stop",
-		Short: "Stop a daemon started with this PID file",
+		Short: "Stop daemon via PID file / 通过 PID 文件停止 daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Load PID written by `daemon`.
 			// 读取 `daemon` 写入的 PID。
 			pid, err := readPIDFile(cfg.PIDPath)
 			if err != nil {
+				logx.Error("read pid file failed", "component", "cli", "path", cfg.PIDPath, "err", err)
 				return err
 			}
+			logx.Info("stopping daemon", "component", "cli", "pid", pid, "path", cfg.PIDPath)
 			// Resolve an os.Process handle (Unix: always succeeds for any pid).
 			// 解析 os.Process 句柄（Unix：任意 pid 通常都能“找到”）。
 			proc, err := os.FindProcess(pid)
 			if err != nil {
+				logx.Error("find process failed", "component", "cli", "pid", pid, "err", err)
 				return err
 			}
 			// Prefer graceful SIGINT so collectors can flush/shutdown.
 			// 优先优雅 SIGINT，便于采集器刷盘/关闭。
 			if err := proc.Signal(os.Interrupt); err != nil {
+				logx.Warn("interrupt signal failed, trying kill", "component", "cli", "pid", pid, "err", err)
 				// Fall back to Kill if Interrupt fails.
 				// Interrupt 失败则回退 Kill。
 				if killErr := proc.Kill(); killErr != nil {
+					logx.Error("kill process failed", "component", "cli", "pid", pid, "err", killErr)
 					return fmt.Errorf("failed to stop pid %d: interrupt error: %v; kill error: %v", pid, err, killErr)
 				}
 			}
@@ -474,6 +568,7 @@ func newStopCommand(cfg *config.Config) *cobra.Command {
 			// 发信号后尽力清理 PID 文件。
 			_ = removePIDFile(cfg.PIDPath)
 			fmt.Printf("bytepulse daemon stopped, pid=%d\n", pid)
+			logx.Info("stop signal sent", "component", "cli", "pid", pid)
 			return nil
 		},
 	}
@@ -485,7 +580,7 @@ func newStopCommand(cfg *config.Config) *cobra.Command {
 func newStatusCommand(cfg *config.Config) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "status",
-		Short: "Show the latest sampled network speed",
+		Short: "Show latest network speed / 显示最新网速",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store, err := openStore(cfg)
 			if err != nil {
@@ -524,7 +619,7 @@ func newReportCommand(cfg *config.Config) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "report",
-		Short: "Show traffic totals and average rates for a time range",
+		Short: "Show traffic totals for a range / 显示时间范围内流量合计",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			d, err := config.ParseRange(rangeText)
 			if err != nil {
@@ -559,7 +654,7 @@ func newReportCommand(cfg *config.Config) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&rangeText, "range", "24h", "time range: 1h,2h,3h,5h,10h,12h,24h,2d,3d,7d,15d")
+	cmd.Flags().StringVar(&rangeText, "range", "24h", "time range / 时间范围: 1h,2h,...,15d")
 	return cmd
 }
 
@@ -568,7 +663,7 @@ func newReportCommand(cfg *config.Config) *cobra.Command {
 func newInterfacesCommand(cfg *config.Config) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "interfaces",
-		Short: "List network interfaces visible to the collector",
+		Short: "List network interfaces / 列出网卡",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Include loopback; used for discovery, not continuous sampling.
 			// 包含回环；用于发现，不是持续采样。
@@ -597,7 +692,7 @@ func newInterfacesCommand(cfg *config.Config) *cobra.Command {
 func newTUICommand(cfg *config.Config) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "tui",
-		Short: "Open the terminal dashboard",
+		Short: "Open terminal dashboard / 打开终端看板",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store, err := openStore(cfg)
 			if err != nil {
@@ -615,13 +710,16 @@ func newTUICommand(cfg *config.Config) *cobra.Command {
 // newWebCommand starts the embedded HTTP dashboard and JSON APIs.
 // newWebCommand 启动内嵌 HTTP 看板与 JSON API。
 func newWebCommand(cfg *config.Config) *cobra.Command {
-	// Listen address is local to this subcommand.
-	// 监听地址仅对本子命令生效。
-	var addr string
+	// Listen address defaults from config file / Default.
+	// 监听地址默认来自配置文件 / Default。
+	addr := cfg.WebAddr
+	if addr == "" {
+		addr = "127.0.0.1:8989"
+	}
 
 	cmd := &cobra.Command{
 		Use:   "web",
-		Short: "Start the local web dashboard",
+		Short: "Start local web dashboard / 启动本地 Web 看板",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store, err := openStore(cfg)
 			if err != nil {
@@ -629,14 +727,31 @@ func newWebCommand(cfg *config.Config) *cobra.Command {
 			}
 			defer store.Close()
 
+			// Non-blocking hint if daemon is down (page still serves NIC data).
+			// daemon 未启动时给出提示（页面仍可提供网卡数据）。
+			client := daemonclient.New(cfg.DaemonAPIAddr)
+			if err := client.Health(context.Background()); err != nil {
+				hint := config.DaemonStartHint(*cfg)
+				fmt.Fprint(os.Stderr, i18n.Tf("cli.web_no_daemon", map[string]string{
+					"api": cfg.DaemonAPIAddr,
+					"cmd": hint,
+				}))
+				logx.Warn("web started without daemon", "component", "web", "api", cfg.DaemonAPIAddr, "err", err)
+			}
+
 			s := web.New(store, *cfg)
 			fmt.Printf("bytepulse web listening on http://%s\n", addr)
+			logx.Info("web server starting", "component", "web", "addr", addr, "db", cfg.DBPath, "daemon_api", cfg.DaemonAPIAddr)
 			// Blocks until the server exits (or bind fails).
 			// 阻塞直到服务退出（或绑定失败）。
-			return s.ListenAndServe(addr)
+			if err := s.ListenAndServe(addr); err != nil {
+				logx.Error("web server stopped", "component", "web", "addr", addr, "err", err)
+				return err
+			}
+			return nil
 		},
 	}
 
-	cmd.Flags().StringVar(&addr, "addr", "127.0.0.1:8989", "HTTP listen address")
+	cmd.Flags().StringVar(&addr, "addr", addr, "HTTP listen address / HTTP 监听地址")
 	return cmd
 }

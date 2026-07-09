@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"bytepulse/internal/logx"
 	"bytepulse/internal/storage"
 
 	gopsnet "github.com/shirou/gopsutil/v4/net"
@@ -86,8 +87,10 @@ func (c *Collector) Run(ctx context.Context) error {
 	// 先取基线快照；第一拍相对此基线计算增量。
 	prev, err := ReadCounters(c.opts.Interface)
 	if err != nil {
+		logx.Error("read interface counters failed at start", "component", "collector", "err", err, "interface", c.opts.Interface)
 		return err
 	}
+	logx.Info("interface collector running", "component", "collector", "interval", c.opts.Interval.String(), "interface", c.opts.Interface)
 	// Timestamp of the baseline (or last successful sample).
 	// 基线（或上次成功样本）的时间戳。
 	prevAt := time.Now()
@@ -108,6 +111,7 @@ func (c *Collector) Run(ctx context.Context) error {
 			// 读取当前累计计数。
 			current, err := ReadCounters(c.opts.Interface)
 			if err != nil {
+				logx.Error("read interface counters failed", "component", "collector", "err", err)
 				return err
 			}
 
@@ -118,13 +122,29 @@ func (c *Collector) Run(ctx context.Context) error {
 				// Persist this interval.
 				// 持久化本区间。
 				if err := c.store.InsertSamples(samples); err != nil {
+					logx.Error("insert samples failed", "component", "collector", "err", err, "n", len(samples))
 					return err
 				}
 				// Drop rows older than retention (runs every successful tick).
 				// 删除超过保留期的行（每次成功采样都会跑）。
 				if err := c.store.Cleanup(now, c.opts.Retention); err != nil {
+					logx.Error("cleanup samples failed", "component", "collector", "err", err)
 					return err
 				}
+				var rx, tx uint64
+				for _, s := range samples {
+					rx += s.RXBytes
+					tx += s.TXBytes
+				}
+				logx.Debug("interface samples stored",
+					"component", "collector",
+					"ifaces", len(samples),
+					"rx_bytes", rx,
+					"tx_bytes", tx,
+					"interval_sec", now.Sub(prevAt).Seconds(),
+				)
+			} else {
+				logx.Debug("no interface samples this tick", "component", "collector", "ifaces_seen", len(current))
 			}
 
 			// Advance baseline for the next tick.

@@ -37,12 +37,33 @@ type Config struct {
 	// DaemonAPIAddr is the local HTTP address for realtime process APIs.
 	// DaemonAPIAddr 是进程实时 API 的本机 HTTP 地址。
 	DaemonAPIAddr string
-	// ProcessTraffic selects per-process traffic mode: "off" or "nettop".
-	// ProcessTraffic 选择每进程流量模式："off" 或 "nettop"。
+	// ProcessTraffic selects per-process traffic mode: off, auto, nettop, estats.
+	// ProcessTraffic 选择每进程流量模式：off、auto、nettop、estats。
 	ProcessTraffic string
 	// ExcludeSelf hides the bytepulse process itself from process views (default true).
 	// ExcludeSelf 为 true 时从进程视图中隐藏 bytepulse 自身（默认开启）。
 	ExcludeSelf bool
+	// LogLevel is debug|info|warn|error (default error).
+	// LogLevel 为 debug|info|warn|error（默认 error）。
+	LogLevel string
+	// LogFormat is text|json (default text).
+	// LogFormat 为 text|json（默认 text）。
+	LogFormat string
+	// LogFile is optional log path; empty writes to stderr.
+	// LogFile 为可选日志路径；空则写 stderr。
+	LogFile string
+	// DaemonInterval is the interface sampling interval for `daemon` (default 1s).
+	// DaemonInterval 是 `daemon` 网卡采样间隔（默认 1s）。
+	DaemonInterval time.Duration
+	// WebAddr is the default listen address for `web`.
+	// WebAddr 是 `web` 的默认监听地址。
+	WebAddr string
+	// ConfigPath is the config file path that was loaded (empty if none).
+	// ConfigPath 是已加载的配置文件路径（未加载则为空）。
+	ConfigPath string
+	// Lang is UI language: en or zh (logs stay English; help is bilingual in code).
+	// Lang 为界面语言：en 或 zh（日志保持英文；help 在代码里中英双语写死）。
+	Lang string
 }
 
 // Default returns sensible paths under ~/.bytepulse and safe feature defaults.
@@ -84,6 +105,19 @@ func Default() Config {
 		// Hide self from process lists by default.
 		// 默认在进程列表中隐藏自身。
 		ExcludeSelf: true,
+		// Quiet by default; raise to info/debug when diagnosing.
+		// 默认安静；排错时提高到 info/debug。
+		LogLevel:  "error",
+		LogFormat: "text",
+		// Default daemon interface sample interval.
+		// 默认 daemon 网卡采样间隔。
+		DaemonInterval: time.Second,
+		// Default web listen address.
+		// 默认 web 监听地址。
+		WebAddr: "127.0.0.1:8989",
+		// Default UI language English.
+		// 默认界面语言为英文。
+		Lang: "en",
 	}
 }
 
