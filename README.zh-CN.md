@@ -14,6 +14,7 @@ BytePulse 是一个本地网络流量监控工具，提供 CLI、TUI 和本地 W
 - 提供 CLI、TUI 和本地 Web 仪表盘。
 - 支持通过 `--interface` 查看指定网卡。
 - macOS 支持进程连接发现：进程名、完整进程路径、PID、连接数和最后出现时间。
+- 默认在进程视图中隐藏 BytePulse 自身（`--exclude-self`；设为 `false` 可显示）。
 - CLI、TUI、Web 的进程视图通过 daemon API 每 1 秒实时刷新。
 - macOS 可选通过 `nettop` 显示按进程实时流量。
 - 使用本地 SQLite 存储数据。
@@ -191,6 +192,21 @@ http://127.0.0.1:8989
 ```bash
 ./bytepulse --daemon-api-addr 127.0.0.1:8988 daemon
 ./bytepulse --daemon-api-addr 127.0.0.1:8988 processes --watch
+```
+
+从进程视图中隐藏 BytePulse 自身（默认开启）。匹配依据为 daemon 自身 PID，以及可执行名 `bytepulse` / `bytepulse.exe`：
+
+```bash
+./bytepulse daemon
+./bytepulse processes
+```
+
+在进程视图中显示 BytePulse 自身（便于调试）：
+
+```bash
+./bytepulse --exclude-self=false daemon
+./bytepulse --exclude-self=false processes
+./bytepulse --exclude-self=false processes --range 24h
 ```
 
 ## 资源占用

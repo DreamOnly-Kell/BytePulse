@@ -14,6 +14,7 @@ BytePulse is a local network traffic monitor with CLI, TUI, and Web dashboards. 
 - CLI, TUI, and local Web dashboard.
 - Per-interface filtering with `--interface`.
 - Process connection discovery on macOS: process name, full process path, PID, connection count, and last seen time.
+- Hides BytePulse itself from process views by default (`--exclude-self`; set to `false` to show it).
 - 1-second realtime process refresh through the daemon API for CLI, TUI, and Web.
 - Optional macOS per-process realtime traffic attribution through `nettop`.
 - Local SQLite storage.
@@ -191,6 +192,21 @@ Use a custom daemon API address:
 ```bash
 ./bytepulse --daemon-api-addr 127.0.0.1:8988 daemon
 ./bytepulse --daemon-api-addr 127.0.0.1:8988 processes --watch
+```
+
+Hide BytePulse from process views (default is on). Matching uses the daemon PID and the executable name `bytepulse` / `bytepulse.exe`:
+
+```bash
+./bytepulse daemon
+./bytepulse processes
+```
+
+Show BytePulse itself in process views (debugging):
+
+```bash
+./bytepulse --exclude-self=false daemon
+./bytepulse --exclude-self=false processes
+./bytepulse --exclude-self=false processes --range 24h
 ```
 
 ## Resource Usage

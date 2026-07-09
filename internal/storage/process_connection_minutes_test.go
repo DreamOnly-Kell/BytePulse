@@ -140,6 +140,20 @@ func TestCleanupProcessConnectionMinutesRemovesExpiredRows(t *testing.T) {
 	}
 }
 
+func TestFilterSelfSummariesRemovesBytepulse(t *testing.T) {
+	items := []ProcessConnectionSummary{
+		{PID: 1, ProcessName: "curl", ProcessKey: "1:1"},
+		{PID: 2, ProcessName: "bytepulse", ProcessPath: "/tmp/bytepulse", ProcessKey: "2:1"},
+	}
+	got := FilterSelfSummaries(items, true)
+	if len(got) != 1 || got[0].ProcessName != "curl" {
+		t.Fatalf("got=%v, want only curl", got)
+	}
+	if len(FilterSelfSummaries(items, false)) != 2 {
+		t.Fatal("exclude disabled should keep all")
+	}
+}
+
 func TestTopProcessConnectionMinutesReturnsEmptySliceWithoutRows(t *testing.T) {
 	store := newTestStore(t)
 	now := time.Date(2026, 7, 8, 10, 15, 0, 0, time.UTC)

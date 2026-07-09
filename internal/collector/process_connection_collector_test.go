@@ -94,6 +94,30 @@ func TestProcessConnectionCollectorFlushesCompletedMinute(t *testing.T) {
 	}
 }
 
+func TestProcessConnectionCollectorExcludesSelfWhenEnabled(t *testing.T) {
+	state := processstate.New()
+	now := time.Now()
+	sampler := &fakeProcessSampler{
+		results: [][]proc.Connection{{
+			{PID: 42, ProcessName: "bytepulse", ProcessKey: "42:0", SeenAt: now},
+			{PID: 7, ProcessName: "curl", ProcessKey: "7:0", SeenAt: now},
+		}},
+	}
+	store := &fakeProcessStore{}
+	c := NewProcessConnectionCollector(store, sampler, state, ProcessConnectionOptions{
+		Interval:    time.Hour,
+		ExcludeSelf: true,
+		SelfPID:     42,
+	})
+	if err := c.sampleOnce(now); err != nil {
+		t.Fatalf("sampleOnce: %v", err)
+	}
+	got := state.LatestSummaries(10)
+	if len(got) != 1 || got[0].ProcessName != "curl" {
+		t.Fatalf("summaries=%v, want only curl", got)
+	}
+}
+
 func TestProcessConnectionCollectorUnsupportedSamplerExitsNil(t *testing.T) {
 	state := processstate.New()
 	sampler := &fakeProcessSampler{errs: []error{proc.ErrNotSupported}}

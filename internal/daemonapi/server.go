@@ -127,10 +127,20 @@ func (s *Server) handleProcessesTop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
-	items, err := s.store.TopProcessConnectionMinutes(now.Add(-d), now, limit)
+	fetchLimit := limit
+	if s.cfg.ExcludeSelf && limit > 0 {
+		fetchLimit = limit + 5
+	}
+	items, err := s.store.TopProcessConnectionMinutes(now.Add(-d), now, fetchLimit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	// Drop historical bytepulse rows when exclude-self is enabled.
+	// 开启 exclude-self 时去掉历史中的 bytepulse 行。
+	items = storage.FilterSelfSummaries(items, s.cfg.ExcludeSelf)
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
 	}
 	writeJSON(w, items)
 }

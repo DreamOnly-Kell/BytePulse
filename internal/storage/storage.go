@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"bytepulse/internal/proc"
+
 	// Pure-Go SQLite driver (no CGO).
 	// 纯 Go SQLite 驱动（无 CGO）。
 	_ "modernc.org/sqlite"
@@ -92,6 +94,24 @@ type ProcessConnectionSummary struct {
 	// 表示活跃时长信号，不是连接数。
 	SampleCount int       `json:"sample_count"`
 	LastSeen    time.Time `json:"last_seen"`
+}
+
+// FilterSelfSummaries removes bytepulse-like rows when excludeSelf is true.
+// Historical rows use name/path only (selfPID is 0).
+// FilterSelfSummaries 在 excludeSelf 为 true 时去掉类 bytepulse 行。
+// 历史行仅按名称/路径匹配（selfPID 为 0）。
+func FilterSelfSummaries(items []ProcessConnectionSummary, excludeSelf bool) []ProcessConnectionSummary {
+	if !excludeSelf || len(items) == 0 {
+		return items
+	}
+	out := make([]ProcessConnectionSummary, 0, len(items))
+	for _, item := range items {
+		if proc.IsSelfProcess(item.PID, item.ProcessName, item.ProcessPath, 0) {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 // AvgRXBps returns average download B/s over the summary window.

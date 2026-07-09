@@ -63,6 +63,7 @@ func newRootCommand() *cobra.Command {
 	cmd.PersistentFlags().DurationVar(&cfg.ProcessInterval, "process-interval", cfg.ProcessInterval, "process connection sampling interval")
 	cmd.PersistentFlags().StringVar(&cfg.DaemonAPIAddr, "daemon-api-addr", cfg.DaemonAPIAddr, "daemon local API address")
 	cmd.PersistentFlags().StringVar(&cfg.ProcessTraffic, "process-traffic", cfg.ProcessTraffic, "process traffic attribution mode: off, nettop")
+	cmd.PersistentFlags().BoolVar(&cfg.ExcludeSelf, "exclude-self", cfg.ExcludeSelf, "hide bytepulse itself from process views (default true)")
 
 	// Register each user-facing subcommand.
 	// 注册各面向用户的子命令。
@@ -152,8 +153,10 @@ func newDaemonCommand(cfg *config.Config) *cobra.Command {
 				proc.NewSampler(),
 				procState,
 				collector.ProcessConnectionOptions{
-					Interval:  cfg.ProcessInterval,
-					Retention: cfg.Retention,
+					Interval:    cfg.ProcessInterval,
+					Retention:   cfg.Retention,
+					ExcludeSelf: cfg.ExcludeSelf,
+					SelfPID:     os.Getpid(),
 				},
 			)
 			// Local HTTP API for realtime process views.
@@ -333,11 +336,21 @@ func printHistoricalProcesses(cfg *config.Config, rangeText string, limit int) e
 	defer store.Close()
 
 	now := time.Now()
+	// Over-fetch slightly when excluding self so limit still fills after filter.
+	// 排除自身时略多取一些，过滤后仍尽量凑满 limit。
+	fetchLimit := limit
+	if cfg.ExcludeSelf && limit > 0 {
+		fetchLimit = limit + 5
+	}
 	// Rank processes by rolled-up minute stats (see storage package semantics).
 	// 按分钟聚合统计排序进程（语义见 storage 包）。
-	items, err := store.TopProcessConnectionMinutes(now.Add(-d), now, limit)
+	items, err := store.TopProcessConnectionMinutes(now.Add(-d), now, fetchLimit)
 	if err != nil {
 		return err
+	}
+	items = storage.FilterSelfSummaries(items, cfg.ExcludeSelf)
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
 	}
 	printStorageProcessRows(items)
 	return nil

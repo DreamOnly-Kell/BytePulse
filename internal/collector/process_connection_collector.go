@@ -32,6 +32,12 @@ type ProcessConnectionOptions struct {
 	// Retention for process_connection_minutes rows.
 	// process_connection_minutes 行的保留期。
 	Retention time.Duration
+	// ExcludeSelf drops the monitoring process from samples when true.
+	// ExcludeSelf 为 true 时从采样中去掉监控进程自身。
+	ExcludeSelf bool
+	// SelfPID is the daemon PID used for exclude-self matching (0 = name only).
+	// SelfPID 是 exclude-self 用的 daemon PID（0 表示仅按名称匹配）。
+	SelfPID int
 }
 
 // ProcessConnectionCollector samples sockets, updates memory state, flushes minutes.
@@ -123,6 +129,9 @@ func (c *ProcessConnectionCollector) sampleOnce(now time.Time) error {
 	if err != nil {
 		return nil
 	}
+	// Optionally drop bytepulse / own PID before updating state and SQLite.
+	// 可选在更新内存态与 SQLite 前去掉 bytepulse / 自身 PID。
+	conns = proc.FilterSelfConnections(conns, c.opts.ExcludeSelf, c.opts.SelfPID)
 	// Replace latest process/connection maps and update minute buckets.
 	// 替换最新进程/连接映射并更新分钟桶。
 	c.state.Update(conns, now)

@@ -40,6 +40,9 @@ type Config struct {
 	// ProcessTraffic selects per-process traffic mode: "off" or "nettop".
 	// ProcessTraffic 选择每进程流量模式："off" 或 "nettop"。
 	ProcessTraffic string
+	// ExcludeSelf hides the bytepulse process itself from process views (default true).
+	// ExcludeSelf 为 true 时从进程视图中隐藏 bytepulse 自身（默认开启）。
+	ExcludeSelf bool
 }
 
 // Default returns sensible paths under ~/.bytepulse and safe feature defaults.
@@ -78,6 +81,9 @@ func Default() Config {
 		// Disable optional nettop attribution unless explicitly enabled.
 		// 默认关闭可选的 nettop 流量归因，需显式开启。
 		ProcessTraffic: "off",
+		// Hide self from process lists by default.
+		// 默认在进程列表中隐藏自身。
+		ExcludeSelf: true,
 	}
 }
 
