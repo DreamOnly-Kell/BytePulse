@@ -1,3 +1,5 @@
+// Package web serves the local HTTP dashboard and JSON APIs.
+// web 包提供本机 HTTP 看板与 JSON API。
 package web
 
 import (
@@ -15,63 +17,93 @@ import (
 	"bytepulse/internal/storage"
 )
 
+// processClient is the subset of daemonclient used for realtime processes.
+// processClient 是用于实时进程的 daemonclient 子集。
 type processClient interface {
 	Processes(context.Context, int) ([]processstate.ProcessConnectionSummary, error)
 }
 
+// Server holds SQLite access, config, routes, and the process API client.
+// Server 持有 SQLite 访问、配置、路由与进程 API 客户端。
 type Server struct {
-	store         *storage.Store
-	cfg           config.Config
-	mux           *http.ServeMux
+	// store backs interface traffic endpoints. / store 支撑网卡流量相关端点。
+	store *storage.Store
+	// cfg supplies interface filter, bits mode, TopN, daemon API addr.
+	// cfg 提供网卡过滤、bits 模式、TopN、daemon API 地址。
+	cfg config.Config
+	// mux is the HTTP router. / mux 是 HTTP 路由器。
+	mux *http.ServeMux
+	// processClient proxies /api/processes to the daemon.
+	// processClient 将 /api/processes 代理到 daemon。
 	processClient processClient
 }
 
+// New constructs the web server and registers routes.
+// New 构造 Web 服务器并注册路由。
 func New(store *storage.Store, cfg config.Config) *Server {
 	s := &Server{
-		store:         store,
-		cfg:           cfg,
-		mux:           http.NewServeMux(),
+		store: store,
+		cfg:   cfg,
+		mux:   http.NewServeMux(),
+		// Default process client points at the running daemon API.
+		// 默认进程客户端指向正在运行的 daemon API。
 		processClient: daemonclient.New(cfg.DaemonAPIAddr),
 	}
 	s.routes()
 	return s
 }
 
+// ListenAndServe binds addr and serves until error/shutdown.
+// ListenAndServe 绑定 addr 并服务直到错误/关闭。
 func (s *Server) ListenAndServe(addr string) error {
 	return http.ListenAndServe(addr, s.mux)
 }
 
+// routes wires dashboard HTML and all JSON API paths.
+// routes 挂接看板 HTML 与全部 JSON API 路径。
 func (s *Server) routes() {
-	s.mux.HandleFunc("/", s.handleIndex)
-	s.mux.HandleFunc("/api/realtime", s.handleRealtime)
-	s.mux.HandleFunc("/api/summary", s.handleSummary)
-	s.mux.HandleFunc("/api/ranges", s.handleRanges)
-	s.mux.HandleFunc("/api/hourly", s.handleHourly)
-	s.mux.HandleFunc("/api/daily", s.handleDaily)
-	s.mux.HandleFunc("/api/series", s.handleSeries)
-	s.mux.HandleFunc("/api/processes", s.handleProcesses)
-	s.mux.HandleFunc("/api/processes/top", s.handleProcessesTop)
+	s.mux.HandleFunc("/", s.handleIndex)                         // SPA page / 单页看板
+	s.mux.HandleFunc("/api/realtime", s.handleRealtime)          // latest speed / 最新速率
+	s.mux.HandleFunc("/api/summary", s.handleSummary)            // one range total / 单范围总量
+	s.mux.HandleFunc("/api/ranges", s.handleRanges)              // all preset ranges / 全部预设范围
+	s.mux.HandleFunc("/api/hourly", s.handleHourly)              // hourly buckets / 小时桶
+	s.mux.HandleFunc("/api/daily", s.handleDaily)                // daily buckets / 日桶
+	s.mux.HandleFunc("/api/series", s.handleSeries)              // chart series / 图表序列
+	s.mux.HandleFunc("/api/processes", s.handleProcesses)        // realtime processes / 实时进程
+	s.mux.HandleFunc("/api/processes/top", s.handleProcessesTop) // historical ranks / 历史排行
 }
 
+// handleIndex serves the embedded SPA; only exact "/" is valid.
+// handleIndex 提供内嵌 SPA；仅精确路径 "/" 有效。
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	// Reject paths like /favicon.ico so they are not the dashboard HTML.
+	// 拒绝 /favicon.ico 等路径，避免误返回看板 HTML。
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// Inject bits mode into the JS constant __USE_BITS__.
+	// 将 bits 模式注入 JS 常量 __USE_BITS__。
 	html := strings.Replace(indexHTML, "__USE_BITS__", strconv.FormatBool(s.cfg.UseBits), 1)
 	_, _ = w.Write([]byte(html))
 }
 
+// handleRealtime returns the latest combined interface sample as JSON.
+// handleRealtime 以 JSON 返回最新合并网卡样本。
 func (s *Server) handleRealtime(w http.ResponseWriter, r *http.Request) {
 	sample, err := s.store.LatestAggregateSample(s.interfaceName(r))
 	if err != nil {
+		// Empty DB → 404 so the UI can show "waiting for samples".
+		// 空库 → 404，UI 可显示 waiting for samples。
 		writeError(w, http.StatusNotFound, err)
 		return
 	}
 	writeJSON(w, sample)
 }
 
+// handleSummary returns RX/TX totals for ?range= (default 24h).
+// handleSummary 返回 ?range=（默认 24h）的 RX/TX 总量。
 func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	rangeText := r.URL.Query().Get("range")
 	if rangeText == "" {
@@ -92,11 +124,15 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, summary)
 }
 
+// handleRanges returns summaries for every built-in range label.
+// handleRanges 返回每个内置范围标签的汇总。
 func (s *Server) handleRanges(w http.ResponseWriter, r *http.Request) {
 	labels := []string{"1h", "2h", "3h", "5h", "10h", "12h", "24h", "2d", "3d", "7d", "15d"}
 	now := time.Now()
 	items := make([]rangeResponse, 0, len(labels))
 	for _, label := range labels {
+		// ParseRange cannot fail for these hardcoded labels.
+		// 这些硬编码标签不会 Parse 失败。
 		d, _ := config.ParseRange(label)
 		summary, err := s.store.Summary(now.Add(-d), now, s.interfaceName(r))
 		if err != nil {
@@ -108,6 +144,8 @@ func (s *Server) handleRanges(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, items)
 }
 
+// handleHourly returns hourly buckets for the last 24 hours.
+// handleHourly 返回最近 24 小时的小时桶。
 func (s *Server) handleHourly(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	buckets, err := s.store.Hourly(now.Add(-24*time.Hour), now, s.interfaceName(r))
@@ -118,6 +156,8 @@ func (s *Server) handleHourly(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, buckets)
 }
 
+// handleDaily returns daily buckets for the last 15 days.
+// handleDaily 返回最近 15 天的日桶。
 func (s *Server) handleDaily(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	buckets, err := s.store.Daily(now.Add(-15*24*time.Hour), now, s.interfaceName(r))
@@ -128,6 +168,8 @@ func (s *Server) handleDaily(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, buckets)
 }
 
+// handleSeries returns the last hour of per-timestamp aggregates for charting.
+// handleSeries 返回最近一小时按时间戳聚合的序列用于画图。
 func (s *Server) handleSeries(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	series, err := s.store.RecentSeries(now.Add(-time.Hour), now, s.interfaceName(r))
@@ -138,6 +180,8 @@ func (s *Server) handleSeries(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, series)
 }
 
+// handleProcesses proxies realtime process rows from the daemon API.
+// handleProcesses 将实时进程行从 daemon API 代理过来。
 func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
 	limit, err := s.parseLimit(r)
 	if err != nil {
@@ -146,12 +190,16 @@ func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
 	}
 	items, err := s.processClient.Processes(r.Context(), limit)
 	if err != nil {
+		// 503 when daemon is not running or unreachable.
+		// daemon 未运行或不可达时返回 503。
 		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("daemon API unavailable: %w", err))
 		return
 	}
 	writeJSON(w, items)
 }
 
+// handleProcessesTop returns historical process ranks from SQLite.
+// handleProcessesTop 从 SQLite 返回历史进程排行。
 func (s *Server) handleProcessesTop(w http.ResponseWriter, r *http.Request) {
 	limit, err := s.parseLimit(r)
 	if err != nil {
@@ -176,6 +224,8 @@ func (s *Server) handleProcessesTop(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, items)
 }
 
+// parseLimit reads ?limit= or falls back to cfg.TopN (default 30).
+// parseLimit 读取 ?limit= 或回退 cfg.TopN（默认 30）。
 func (s *Server) parseLimit(r *http.Request) (int, error) {
 	limit := s.cfg.TopN
 	if limit <= 0 {
@@ -192,6 +242,8 @@ func (s *Server) parseLimit(r *http.Request) (int, error) {
 	return parsed, nil
 }
 
+// interfaceName prefers ?interface= over the server-wide cfg.Interface.
+// interfaceName 优先 ?interface=，否则用服务器级 cfg.Interface。
 func (s *Server) interfaceName(r *http.Request) string {
 	if v := r.URL.Query().Get("interface"); v != "" {
 		return v
@@ -199,24 +251,35 @@ func (s *Server) interfaceName(r *http.Request) string {
 	return s.cfg.Interface
 }
 
+// rangeResponse is one entry in /api/ranges.
+// rangeResponse 是 /api/ranges 中的一条。
 type rangeResponse struct {
 	Range   string                `json:"range"`
 	Summary storage.SummaryResult `json:"summary"`
 }
 
+// writeJSON encodes value as pretty-printed JSON.
+// writeJSON 将 value 编码为美化 JSON。
 func writeJSON(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
+	// Indent for browser readability. / 缩进便于浏览器阅读。
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(value)
 }
 
+// writeError returns a JSON error body with the given status.
+// writeError 以给定状态返回 JSON 错误体。
 func writeError(w http.ResponseWriter, status int, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 }
 
+// indexHTML is the embedded single-page dashboard (HTML/CSS/JS).
+// indexHTML 是内嵌单页看板（HTML/CSS/JS）。
+// Placeholder __USE_BITS__ is replaced at serve time with true/false.
+// 占位符 __USE_BITS__ 在响应时替换为 true/false。
 const indexHTML = `<!doctype html>
 <html lang="en">
 <head>

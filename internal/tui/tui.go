@@ -1,3 +1,5 @@
+// Package tui implements the Bubbletea terminal dashboard.
+// tui 包实现 Bubbletea 终端看板。
 package tui
 
 import (
@@ -16,29 +18,61 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// model is the Bubbletea application state refreshed once per second.
+// model 是每秒刷新一次的 Bubbletea 应用状态。
 type model struct {
-	store         *storage.Store
-	cfg           config.Config
-	width         int
-	height        int
-	latest        storage.Sample
-	ranges        []rangeStat
-	series        []storage.Sample
-	err           error
-	loaded        bool
+	// store provides SQLite reads for interface stats.
+	// store 提供网卡统计的 SQLite 读取。
+	store *storage.Store
+	// cfg holds interface filter, bits mode, TopN, daemon API addr.
+	// cfg 持有网卡过滤、bits 模式、TopN、daemon API 地址。
+	cfg config.Config
+	// width / height track the terminal size for layout.
+	// width / height 记录终端尺寸用于布局。
+	width  int
+	height int
+	// latest is the most recent aggregated interface sample.
+	// latest 是最近一次聚合网卡样本。
+	latest storage.Sample
+	// ranges holds preconfigured traffic window summaries.
+	// ranges 保存预配置时间窗口的流量汇总。
+	ranges []rangeStat
+	// series is the last ~60s of samples for the sparkline.
+	// series 是 sparkline 用的约最近 60 秒样本。
+	series []storage.Sample
+	// err is the last interface data error (empty DB, etc.).
+	// err 是最近一次网卡数据错误（空库等）。
+	err error
+	// loaded becomes true after the first successful interface fetch.
+	// loaded 在首次成功拉取网卡数据后为 true。
+	loaded bool
+	// processClient talks to the daemon API for process rows.
+	// processClient 通过 daemon API 获取进程行。
 	processClient *daemonclient.Client
-	procs         []processstate.ProcessConnectionSummary
-	showProc      bool
-	processErr    error
+	// procs is the latest realtime process list.
+	// procs 是最新实时进程列表。
+	procs []processstate.ProcessConnectionSummary
+	// showProc toggles interface view vs process view (Tab).
+	// showProc 在网卡视图与进程视图间切换（Tab）。
+	showProc bool
+	// processErr is set when the daemon API is unreachable.
+	// processErr 在 daemon API 不可达时设置。
+	processErr error
 }
 
+// rangeStat pairs a range label with its SummaryResult.
+// rangeStat 将范围标签与 SummaryResult 配对。
 type rangeStat struct {
 	Label   string
 	Summary storage.SummaryResult
 }
 
+// tickMsg is delivered every second to trigger refresh().
+// tickMsg 每秒投递一次以触发 refresh()。
 type tickMsg time.Time
 
+// Lipgloss styles for title, labels, values, and errors.
+// 标题、标签、数值与错误的 Lipgloss 样式。
 var (
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
 	labelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
@@ -46,17 +80,25 @@ var (
 	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 )
 
+// Run starts the full-screen TUI until the user quits.
+// Run 启动全屏 TUI，直到用户退出。
 func Run(store *storage.Store, cfg config.Config) error {
+	// Alt screen avoids scrolling the user's prior terminal content.
+	// Alt screen 避免滚动用户原先的终端内容。
 	p := tea.NewProgram(newModel(store, cfg), tea.WithAltScreen())
 	_, err := p.Run()
 	return err
 }
 
+// newModel initializes static range labels and the daemon client.
+// newModel 初始化静态范围标签与 daemon 客户端。
 func newModel(store *storage.Store, cfg config.Config) model {
 	return model{
 		store:         store,
 		cfg:           cfg,
 		processClient: daemonclient.New(cfg.DaemonAPIAddr),
+		// Fixed set of windows shown on the main dashboard.
+		// 主看板展示的固定时间窗口集合。
 		ranges: []rangeStat{
 			{Label: "1h"},
 			{Label: "2h"},
@@ -73,33 +115,51 @@ func newModel(store *storage.Store, cfg config.Config) model {
 	}
 }
 
+// Init schedules the first one-second tick.
+// Init 调度第一次一秒 tick。
 func (m model) Init() tea.Cmd {
 	return tick()
 }
 
+// Update handles keys, resize, and periodic refresh ticks.
+// Update 处理按键、尺寸变化与周期刷新 tick。
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
+		// Quit keys.
+		// 退出键。
 		case "q", "ctrl+c", "esc":
 			return m, tea.Quit
+		// Toggle process vs traffic view.
+		// 在进程视图与流量视图间切换。
 		case "tab":
 			m.showProc = !m.showProc
 		}
 	case tea.WindowSizeMsg:
+		// Store dimensions for path column width / bar width.
+		// 保存尺寸用于路径列宽 / 条形图宽度。
 		m.width = msg.Width
 		m.height = msg.Height
 	case tickMsg:
+		// Reload all dashboard data, then schedule the next tick.
+		// 重新加载看板全部数据，再调度下一 tick。
 		m.refresh()
 		return m, tick()
 	}
 	return m, nil
 }
 
+// refresh loads interface stats from SQLite and processes from the daemon API.
+// refresh 从 SQLite 加载网卡统计，从 daemon API 加载进程。
 func (m *model) refresh() {
+	// Clear previous interface error each tick.
+	// 每拍清除上一次网卡错误。
 	m.err = nil
 	latest, err := m.store.LatestAggregateSample(m.cfg.Interface)
 	if err != nil {
+		// Stop early; process refresh is skipped when interface data fails.
+		// 提前返回；网卡数据失败时跳过进程刷新。
 		m.err = err
 		return
 	}
@@ -107,6 +167,8 @@ func (m *model) refresh() {
 	m.loaded = true
 
 	now := time.Now()
+	// Fill each traffic window summary from SQLite.
+	// 从 SQLite 填充每个流量窗口汇总。
 	for i := range m.ranges {
 		d, err := config.ParseRange(m.ranges[i].Label)
 		if err != nil {
@@ -121,6 +183,8 @@ func (m *model) refresh() {
 		m.ranges[i].Summary = summary
 	}
 
+	// Sparkline uses roughly the last minute of per-second samples.
+	// Sparkline 使用大约最近一分钟的每秒样本。
 	series, err := m.store.RecentSeries(now.Add(-60*time.Second), now, m.cfg.Interface)
 	if err != nil {
 		m.err = err
@@ -128,6 +192,8 @@ func (m *model) refresh() {
 	}
 	m.series = series
 
+	// Process list is best-effort; failure only affects the process view.
+	// 进程列表尽力而为；失败只影响进程视图。
 	if m.processClient != nil {
 		procs, err := m.processClient.Processes(context.Background(), m.cfg.TopN)
 		if err != nil {
@@ -140,28 +206,38 @@ func (m *model) refresh() {
 	}
 }
 
+// View renders either the process table or the main traffic dashboard.
+// View 渲染进程表或主流量看板。
 func (m model) View() string {
 	if m.showProc {
 		return m.processView()
 	}
 
 	var b strings.Builder
+	// Title + current interface filter label.
+	// 标题 + 当前网卡过滤标签。
 	b.WriteString(titleStyle.Render("BytePulse"))
 	b.WriteString("  ")
 	b.WriteString(labelStyle.Render(config.InterfaceLabel(m.cfg.Interface)))
 	b.WriteString("\n\n")
 
+	// Empty-database / missing daemon collection guidance.
+	// 空库 / 未启动采集时的引导。
 	if m.err != nil {
 		b.WriteString(errorStyle.Render(fmt.Sprintf("No data: %v", m.err)))
 		b.WriteString("\n\nStart collection in another terminal with: bytepulse daemon\n")
 		b.WriteString("\nq: quit\n")
 		return b.String()
 	}
+	// Before the first successful tick completes.
+	// 首次成功 tick 完成前。
 	if !m.loaded {
 		b.WriteString("Loading...\n")
 		return b.String()
 	}
 
+	// Live rates, sparkline, multi-window totals, help footer.
+	// 实时速率、sparkline、多窗口总量、帮助页脚。
 	b.WriteString(renderRates(m.latest, m.cfg.UseBits))
 	b.WriteString("\n\n")
 	b.WriteString(labelStyle.Render("Last 60 seconds"))
@@ -175,10 +251,14 @@ func (m model) View() string {
 	return b.String()
 }
 
+// processView renders the Tab process connection table.
+// processView 渲染 Tab 进程连接表。
 func (m model) processView() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("BytePulse [Processes]"))
 	b.WriteString("\n\n")
+	// Daemon must be running for realtime process data.
+	// 实时进程数据需要 daemon 正在运行。
 	if m.processErr != nil {
 		b.WriteString(errorStyle.Render("Daemon API unavailable. Start bytepulse daemon."))
 		b.WriteString("\n\n")
@@ -186,12 +266,16 @@ func (m model) processView() string {
 		b.WriteString("\n")
 		return b.String()
 	}
+	// No rows yet (sampler still warming up or unsupported platform).
+	// 尚无行（采样器预热中或不支持的平台）。
 	if len(m.procs) == 0 {
 		b.WriteString("Waiting for process connection data...\n\n")
 		b.WriteString(labelStyle.Render("tab: switch view | q: quit"))
 		b.WriteString("\n")
 		return b.String()
 	}
+	// PATH column grows with terminal width.
+	// PATH 列随终端宽度增长。
 	pathWidth := max(16, m.width-74)
 	b.WriteString(fmt.Sprintf("%-7s %-16s %-6s %-11s %-11s %-8s %s\n", "PID", "NAME", "CONNS", "RX/s", "TX/s", "LAST", "PATH"))
 	for _, item := range m.procs {
@@ -199,6 +283,8 @@ func (m model) processView() string {
 			item.PID,
 			truncate(item.ProcessName, 16),
 			item.ConnectionCount,
+			// Optional rates from nettop when enabled.
+			// 启用 nettop 时的可选速率。
 			truncate(formatOptionalRate(item.RXBps, item.TrafficAvailable, m.cfg.UseBits), 11),
 			truncate(formatOptionalRate(item.TXBps, item.TrafficAvailable, m.cfg.UseBits), 11),
 			item.LastSeen.Local().Format("15:04:05"),
@@ -211,6 +297,8 @@ func (m model) processView() string {
 	return b.String()
 }
 
+// displayPath prefers full path over short name.
+// displayPath 优先完整路径而非短名。
 func displayPath(path, fallback string) string {
 	if path != "" {
 		return path
@@ -218,6 +306,8 @@ func displayPath(path, fallback string) string {
 	return fallback
 }
 
+// formatOptionalRate shows "--" when traffic attribution is unavailable.
+// formatOptionalRate 在流量归因不可用时显示 "--"。
 func formatOptionalRate(rate float64, ok bool, bits bool) string {
 	if !ok {
 		return "--"
@@ -225,6 +315,8 @@ func formatOptionalRate(rate float64, ok bool, bits bool) string {
 	return units.FormatRate(rate, bits)
 }
 
+// renderRates formats download/upload/total/updated lines.
+// renderRates 格式化下载/上传/总计/更新时间行。
 func renderRates(sample storage.Sample, bits bool) string {
 	rows := []string{
 		fmt.Sprintf("%-10s %s", "Download", valueStyle.Render(units.FormatRate(sample.RXSpeedBps, bits))),
@@ -235,6 +327,8 @@ func renderRates(sample storage.Sample, bits bool) string {
 	return strings.Join(rows, "\n")
 }
 
+// renderRanges prints multi-window traffic totals and average rates.
+// renderRanges 打印多窗口流量总量与平均速率。
 func renderRanges(stats []rangeStat, bits bool) string {
 	var b strings.Builder
 	b.WriteString(labelStyle.Render("Traffic windows"))
@@ -253,17 +347,25 @@ func renderRanges(stats []rangeStat, bits bool) string {
 	return b.String()
 }
 
+// renderBars draws a unicode sparkline of total speed over recent samples.
+// renderBars 用 unicode sparkline 绘制近期样本的总速率。
 func renderBars(series []storage.Sample, width int) string {
 	if len(series) == 0 {
 		return "(no recent samples)"
 	}
+	// Cap visual width so ultra-wide terminals stay readable.
+	// 限制视觉宽度，超宽终端仍可读。
 	if width > 80 {
 		width = 80
 	}
+	// Keep only the rightmost `width` samples (most recent).
+	// 只保留最右侧 `width` 个样本（最近）。
 	if len(series) > width {
 		series = series[len(series)-width:]
 	}
 
+	// Find peak total speed for normalization.
+	// 找峰值总速率用于归一化。
 	var peak float64
 	values := make([]float64, len(series))
 	for i, sample := range series {
@@ -272,13 +374,19 @@ func renderBars(series []storage.Sample, width int) string {
 			peak = values[i]
 		}
 	}
+	// All zeros → flat low bar.
+	// 全零 → 平坦低条。
 	if peak <= 0 {
 		return strings.Repeat("▁", len(values))
 	}
 
+	// Block elements from low to high.
+	// 从低到高的方块字符。
 	levels := []rune("▁▂▃▄▅▆▇█")
 	var b strings.Builder
 	for _, v := range values {
+		// Map value into [0, len(levels)-1].
+		// 将数值映射到 [0, len(levels)-1]。
 		idx := int((v / peak) * float64(len(levels)-1))
 		if idx < 0 {
 			idx = 0
@@ -291,12 +399,16 @@ func renderBars(series []storage.Sample, width int) string {
 	return b.String()
 }
 
+// tick returns a Cmd that fires tickMsg after one second.
+// tick 返回一秒后触发 tickMsg 的 Cmd。
 func tick() tea.Cmd {
 	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
 }
 
+// max returns the larger of two ints.
+// max 返回两个 int 中较大者。
 func max(a, b int) int {
 	if a > b {
 		return a
@@ -304,6 +416,10 @@ func max(a, b int) int {
 	return b
 }
 
+// truncate shortens text to width with an ellipsis when needed.
+// truncate 在需要时用省略号将文本截到 width。
+// Note: byte-based, not rune-based.
+// 注意：按字节而非 rune。
 func truncate(text string, width int) string {
 	if len(text) <= width {
 		return text
