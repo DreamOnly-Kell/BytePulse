@@ -49,35 +49,31 @@ func (f *fakeProcessStore) CleanupProcessConnectionMinutes(time.Time, time.Durat
 }
 
 func TestProcessConnectionCollectorUpdatesRealtimeStateBeforeFlush(t *testing.T) {
+	// Deterministic sampleOnce path: a 1ms Run loop is racy because the fake
+	// sampler returns empty after the first call, and State.Update replaces
+	// (does not merge) — a second tick can clear summaries before the test sees them.
+	// 确定性 sampleOnce：1ms 的 Run 循环有竞态——fake 第二次返回空切片，
+	// State.Update 是全量替换，第二拍可能在测试读到之前清空摘要。
 	state := processstate.New()
+	now := time.Date(2026, 7, 8, 10, 15, 1, 0, time.UTC)
 	sampler := &fakeProcessSampler{
 		results: [][]proc.Connection{{
-			{PID: 1, ProcessName: "curl", ProcessKey: "1:0", SeenAt: time.Now()},
+			{PID: 1, ProcessName: "curl", ProcessKey: "1:0", SeenAt: now},
 		}},
 	}
 	store := &fakeProcessStore{}
-	collector := NewProcessConnectionCollector(store, sampler, state, ProcessConnectionOptions{Interval: time.Millisecond})
+	c := NewProcessConnectionCollector(store, sampler, state, ProcessConnectionOptions{Interval: time.Hour})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- collector.Run(ctx) }()
-
-	deadline := time.After(3 * time.Second)
-	for {
-		if len(state.LatestSummaries(10)) > 0 {
-			cancel()
-			if err := <-done; err != nil {
-				t.Fatalf("run: %v", err)
-			}
-			return
-		}
-		select {
-		case <-deadline:
-			cancel()
-			t.Fatalf("state was not updated")
-		default:
-			time.Sleep(time.Millisecond)
-		}
+	if err := c.sampleOnce(now); err != nil {
+		t.Fatalf("sampleOnce: %v", err)
+	}
+	if len(state.LatestSummaries(10)) == 0 {
+		t.Fatal("state was not updated")
+	}
+	// Current minute only — nothing completed, so store should not receive a flush.
+	// 仅当前分钟 — 无已完成分钟，store 不应收到 flush。
+	if len(store.minutes) != 0 {
+		t.Fatalf("unexpected flush before minute boundary: %+v", store.minutes)
 	}
 }
 
