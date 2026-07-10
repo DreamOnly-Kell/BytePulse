@@ -10,3 +10,12 @@
 *.log
 *.pid
 dist/
+
+# Agent / LLM local workspace files
+.agents/
+.claude/
+.codex/
+CLAUDE.md
+skills-lock.json
+session.txt
+docs/superpowers/

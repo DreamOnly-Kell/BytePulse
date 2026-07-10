@@ -1,0 +1,83 @@
+# BytePulse sample config (YAML)
+# BytePulse 示例配置（YAML）
+#
+# How to use / 用法:
+#   1. Copy this file:
+#      cp config.example.yaml ~/.bytepulse/config.yaml
+#   2. Edit values as needed (delete lines you want to leave as defaults).
+#      按需修改；不需要的项可以删掉，将使用内置默认值。
+#   3. Or pass an explicit path:
+#      bytepulse --config /path/to/config.yaml daemon
+#
+# Precedence / 优先级:
+#   built-in defaults  <  this file  <  CLI flags
+#   内置默认值         <  本文件      <  命令行参数
+#
+# Paths may use ~ for the home directory (e.g. ~/.bytepulse/bytepulse.db).
+# 路径可用 ~ 表示用户主目录。
+
+# SQLite database path
+# SQLite 数据库路径
+db: ~/.bytepulse/bytepulse.db
+
+# Daemon PID file (used by `bytepulse stop`)
+# daemon PID 文件（`bytepulse stop` 使用）
+pid_file: ~/.bytepulse/bytepulse.pid
+
+# Network interface to monitor; empty = all non-loopback interfaces
+# 要监控的网卡；空 = 所有非回环网卡
+interface: ""
+
+# Show rates as bits/s instead of bytes/s
+# 速率以 bits/s 显示（否则为 bytes/s）
+bits: false
+
+# How long to keep samples / process minutes (Go duration, e.g. 720h = 30 days)
+# 样本与进程分钟数据保留时长（Go duration，如 720h = 30 天）
+retention: 720h
+
+# Default row limit for process lists
+# 进程列表默认行数
+top_n: 30
+
+# Process connection sampling interval
+# 进程连接采样间隔
+process_interval: 1s
+
+# Local daemon HTTP API (TUI / Web / CLI processes read this)
+# 本机 daemon HTTP API（TUI / Web / CLI processes 读取）
+daemon_api_addr: 127.0.0.1:8988
+
+# Per-process traffic: off | auto | nettop (macOS) | estats (Windows)
+# 每进程流量：off | auto | nettop（macOS）| estats（Windows）
+process_traffic: off
+
+# Hide bytepulse itself from process views
+# 在进程视图中隐藏 bytepulse 自身
+exclude_self: true
+
+# Log level: error (default, quiet) | warn | info | debug
+# 日志级别：error（默认，安静）| warn | info | debug
+log_level: error
+
+# Log format: text | json
+# 日志格式：text | json
+log_format: text
+
+# Log file path; empty = stderr only
+# 日志文件路径；空 = 仅 stderr
+log_file: ""
+
+# Interface sampling interval for `bytepulse daemon`
+# `bytepulse daemon` 的网卡采样间隔
+daemon_interval: 1s
+
+# Listen address for `bytepulse web`
+# `bytepulse web` 的监听地址
+web_addr: 127.0.0.1:8989
+
+# UI language for TUI / Web / CLI user messages: en | zh
+# (Logs always stay English. Command --help text is bilingual in the binary.)
+# 界面语言（TUI / Web / CLI 用户提示）：en | zh
+# （日志始终英文。命令 --help 在程序里中英双语写死，不走此开关。）
+lang: en

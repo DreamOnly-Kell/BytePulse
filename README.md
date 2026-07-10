@@ -2,31 +2,47 @@
 
 [简体中文](README.zh-CN.md)
 
-BytePulse is a local network traffic monitor with CLI, TUI, and Web dashboards. It samples network interface counters, stores traffic data in SQLite, and reports real-time speed plus rolling traffic totals.
+BytePulse is a **local, on-demand network troubleshooting tool** — open it when you want to see who is using bandwidth, not a product you must leave running 24×7.
+
+It samples OS network interface counters (no packet capture), stores history in SQLite, and shows real-time speed plus rolling totals through **CLI**, **TUI**, and a local **Web** dashboard. On supported platforms it also shows which processes hold network connections and optional per-process RX/TX rates.
+
+A single **`daemon`** is the shared collector and in-memory process-state producer. Start it when you need live process data; stop it when you are done. **Only one daemon is allowed at a time** — a second `daemon` is refused until you `stop` the first. TUI / Web / CLI never auto-start the daemon: if it is down, they wait or print a clear error with a start hint.
 
 ## Features
 
 - Real-time download, upload, and total speed.
-- Automatic rate units: `B/s`, `KB/s`, `MB/s`, `GB/s`.
-- Optional bits/s display with `--bits`.
-- Rolling traffic summaries for `1h`, `2h`, `3h`, `5h`, `10h`, `12h`, `24h`, `2d`, `3d`, `7d`, and `15d`.
-- Hourly and daily aggregation APIs.
-- CLI, TUI, and local Web dashboard.
+- Automatic rate units: `B/s`, `KB/s`, `MB/s`, `GB/s` (optional `--bits` for bits/s).
+- Rolling traffic summaries: `1h` … `15d`, plus hourly/daily aggregation APIs.
+- CLI, TUI, and local Web dashboard (shared daemon API for process views).
+- **Single daemon only:** exclusive PID-file lock and daemon instance identity; second start is blocked with a stop-then-start hint.
 - Per-interface filtering with `--interface`.
-- Local SQLite storage.
-- No packet capture; BytePulse reads operating-system network counters.
+- Process connection discovery (name, full path, PID, connection count, last seen).
+- Optional per-process RX/TX: macOS `nettop`, Windows TCP ESTATS (`--process-traffic auto`).
+- Hides BytePulse itself from process views by default (`--exclude-self`).
+- Local SQLite storage; optional YAML config; UI language `en` / `zh` (logs stay English).
+- No packet capture — reads operating-system counters only.
 
 ## Platform Support
 
-BytePulse is designed to be cross-platform. The current implementation uses Go and `gopsutil` for network interface counters, so the core CLI, storage, TUI, and Web dashboard are expected to work on macOS, Linux, and Windows.
+| Platform | NIC speed & history | Process connections | Per-process RX/TX |
+| --- | --- | --- | --- |
+| **macOS** | Yes | Yes | Yes (`nettop` / `auto`) |
+| **Windows 10+** | Yes | Yes | Yes, TCP only (`estats` / `auto`; UDP bytes not available) |
+| **Linux** | Yes | Not yet | Not yet |
 
-| Platform | Status |
-| --- | --- |
-| macOS | Tested |
-| Linux | Expected, not fully tested |
-| Windows | Expected, not fully tested |
+- **Core** (interfaces, SQLite, CLI / TUI / Web for NIC data) works on macOS, Linux, and Windows via Go + `gopsutil`.
+- **Process monitoring** is implemented for macOS and Windows. Linux process discovery/traffic is deferred (not a current goal).
+- Per-process RX/TX is **off by default** (`--process-traffic off`). Enable with `auto`, or platform-specific `nettop` / `estats`.
+- When attribution is unavailable, process views still show connection counts and print `--` for `RX/s` / `TX/s`.
 
-Per-process network usage is not implemented yet. When added, it will need platform-specific implementations for macOS, Linux, and Windows.
+## Design notes (what BytePulse is not)
+
+- **Not a 24×7 background service by default.** The daemon is optional: run it while troubleshooting, then `stop`. Installers / `launchd` / systemd integration are optional future work, not required for normal use.
+- **One collector only (enforced).** `daemon` refuses a second start when the PID file is exclusively locked or the configured daemon API already answers `/api/health`. An unlocked stale PID file is safely replaced, even if its old PID has been reused. Multiple viewers (TUI, Web, CLI) against one daemon are fine.
+- **Verified stop.** The PID file stores a random daemon instance ID. `bytepulse stop` signals the process only when `/api/health` returns the same PID and instance ID, preventing a stale PID file from stopping an unrelated process.
+- **No auto-start from TUI/Web.** If the daemon is down, the TUI traffic page and Web NIC charts can still read SQLite, while process views wait for the daemon; CLI process commands exit with a clear start hint.
+- **No packet capture** and **no always-on kernel agent** — OS counters and platform APIs only.
+- **Linux process monitoring** is out of scope for the current phase.
 
 ## Build
 
@@ -79,60 +95,77 @@ zip -j dist/bytepulse-windows-arm64.zip dist/bytepulse-windows-arm64.exe
 
 ## Usage
 
-Start the collector:
+### Typical troubleshooting session
 
 ```bash
-./bytepulse daemon
-```
+# 1) Start the shared collector (only one allowed)
+./bytepulse --process-traffic auto daemon
 
-Stop a foreground collector with `Ctrl+C`.
+# 2) In another terminal, open a viewer
+./bytepulse tui
+# or
+./bytepulse web --addr 127.0.0.1:8989
+# or
+./bytepulse processes --watch
 
-Run the collector in the background:
-
-```bash
-./bytepulse daemon > bytepulse.log 2>&1 &
-```
-
-Stop a background collector:
-
-```bash
+# 3) When finished
 ./bytepulse stop
 ```
 
-Show the latest speed:
+Foreground daemon: stop with `Ctrl+C`. Background example:
+
+```bash
+./bytepulse daemon > bytepulse.log 2>&1 &
+./bytepulse stop
+```
+
+A second `daemon` while one is already running **fails immediately** (does not replace the first). Stop all collectors first, then start a new one:
+
+```bash
+./bytepulse stop
+./bytepulse daemon
+```
+
+### Commands
+
+Show the latest NIC speed / rolling report (reads SQLite; daemon optional for history that already exists):
 
 ```bash
 ./bytepulse status
-```
-
-Show a traffic report:
-
-```bash
 ./bytepulse report --range 24h
-```
-
-List network interfaces:
-
-```bash
 ./bytepulse interfaces
 ```
 
-Open the TUI dashboard:
+Show processes currently using the network (**requires a running daemon**):
+
+```bash
+./bytepulse processes
+./bytepulse processes --watch
+./bytepulse processes --range 24h
+```
+
+Process views show both `NAME` and `PATH`. `NAME` is the short executable name; `PATH` keeps the full path when the platform provides it.
+
+Enable per-process realtime traffic on the daemon:
+
+```bash
+# macOS
+./bytepulse --process-traffic nettop daemon
+# or: --process-traffic auto
+
+# Windows 10+
+bytepulse.exe --process-traffic auto daemon
+# or: --process-traffic estats
+```
+
+Windows rates come from TCP ESTATS (best-effort; some connections need a short warm-up). UDP byte rates are not available on Windows via this API.
+
+TUI / Web:
 
 ```bash
 ./bytepulse tui
-```
-
-Start the Web dashboard:
-
-```bash
 ./bytepulse web --addr 127.0.0.1:8989
-```
-
-Then open:
-
-```text
-http://127.0.0.1:8989
+# → http://127.0.0.1:8989
 ```
 
 ## Options
@@ -156,11 +189,66 @@ Display rates as bits/s:
 ./bytepulse --bits status
 ```
 
-Use a custom daemon PID file:
+Use a custom daemon PID file (single-instance lock is on this file; default `~/.bytepulse/bytepulse.pid`):
 
 ```bash
 ./bytepulse --pid-file ./bytepulse.pid daemon
 ./bytepulse --pid-file ./bytepulse.pid stop
+```
+
+Use a custom daemon API address (default `127.0.0.1:8988`; a healthy API also blocks a second daemon):
+
+```bash
+./bytepulse --daemon-api-addr 127.0.0.1:8988 daemon
+./bytepulse --daemon-api-addr 127.0.0.1:8988 processes --watch
+```
+
+Logging (default level is `error`; raise for diagnostics). Tables still go to stdout; logs go to stderr or a file:
+
+```bash
+./bytepulse --log-level info daemon
+./bytepulse --log-level debug --log-file ~/.bytepulse/bytepulse.log daemon
+./bytepulse --log-level info --log-format json daemon
+```
+
+Optional YAML config. Copy the commented sample and edit:
+
+```bash
+mkdir -p ~/.bytepulse
+cp config.example.yaml ~/.bytepulse/config.yaml
+# edit ~/.bytepulse/config.yaml
+```
+
+- Default path if the file exists: `~/.bytepulse/config.yaml`
+- Or: `--config /path/to.yaml`
+- Precedence: built-in defaults &lt; config file &lt; CLI flags
+- Full annotated sample: [`config.example.yaml`](config.example.yaml)
+
+```bash
+./bytepulse --config ./my.yaml daemon
+```
+
+UI language (`lang` / `--lang`): `en` (default) or `zh` for TUI, Web labels, and CLI user prompts. **Logs always stay English.** Command `--help` text is bilingual in the binary (not switched by `lang`).
+
+```bash
+./bytepulse --lang zh tui
+```
+
+**Daemon down behavior:** the TUI traffic page and Web NIC charts continue reading SQLite; process views show a wait/retry state. CLI `processes` prints an error and a start command. Viewers never auto-start the daemon.
+
+Hide BytePulse from process views (default is on). Matching uses the daemon PID and the executable name `bytepulse` / `bytepulse.exe`:
+
+```bash
+./bytepulse daemon
+./bytepulse processes
+```
+
+Show BytePulse itself in process views (debugging):
+
+```bash
+./bytepulse --exclude-self=false daemon
+./bytepulse --exclude-self=false processes
+./bytepulse --exclude-self=false processes --range 24h
 ```
 
 ## Resource Usage
@@ -177,11 +265,18 @@ Default database path:
 ~/.bytepulse/bytepulse.db
 ```
 
-BytePulse currently keeps up to 15 days of samples. The default collector interval is 1 second, but it can be changed with `daemon --interval`. Each sample stores timestamp, interface name, received bytes, transmitted bytes, receive speed, transmit speed, and sample interval.
+BytePulse keeps up to 30 days of samples by default. The default collector interval is 1 second, but it can be changed with `daemon --interval`. Each interface sample stores timestamp, interface name, received bytes, transmitted bytes, receive speed, transmit speed, and sample interval.
+
+Process connection monitoring also samples every 1 second, but it does not write raw per-second connection snapshots to SQLite. The **daemon** keeps the latest process connection state **in memory** for realtime CLI / TUI / Web views and flushes **minute-level** process rollups to SQLite for historical process reports (`processes --range`, top APIs). A clean shutdown also flushes the current partial minute. Retention cleanup runs at startup and then at most once per hour, rather than on every sample.
 
 Rolling summaries include samples by their sample timestamp. With the default 1-second interval, boundary error is at most about one sample interval. Daily buckets are currently grouped by Unix day boundaries.
 
-Run one collector daemon for a database. Multiple collectors writing to the same database can make the latest combined interface view ambiguous.
+**Only one collector daemon may run at a time** for a configured PID file/API pair (PID-file lock + API health). The PID file also carries a random instance ID used to verify `bytepulse stop`. A second `daemon` exits with an error until you stop the first. Multiple viewers against one daemon are fine. Default PID path:
+
+```text
+~/.bytepulse/bytepulse.pid
+```
+
 
 ## Web API
 
@@ -192,6 +287,8 @@ GET /api/ranges
 GET /api/hourly
 GET /api/daily
 GET /api/series
+GET /api/processes
+GET /api/processes/top?range=24h
 ```
 
 All API endpoints accept `?interface=<name>`. For example:
@@ -203,14 +300,25 @@ GET /api/summary?range=24h&interface=en0
 
 `/api/hourly` returns the latest 24 hours. `/api/daily` returns the latest 15 days.
 
+The daemon-local API also exposes:
+
+```text
+GET /api/health
+GET /api/processes?limit=30
+GET /api/processes/connections?process_key=<key>
+GET /api/processes/top?range=24h&limit=30
+```
+
+`/api/health` returns daemon identity plus the per-process traffic backend state (`disabled`, `starting`, `healthy`, or `degraded`).
+
 ## Roadmap
 
-- Configuration file support.
 - Interface include/exclude rules.
 - CSV and JSON export.
-- macOS `launchd` service setup.
+- Optional OS service helpers (`launchd` / systemd) for users who want a long-running collector.
 - Minute/hour/day aggregate tables for lower long-term storage usage.
-- Per-process network usage view.
+- Linux process connection discovery and traffic attribution (deferred).
+- More robust per-process traffic attribution backends.
 - Desktop tray or widget integration.
 
 ## License
