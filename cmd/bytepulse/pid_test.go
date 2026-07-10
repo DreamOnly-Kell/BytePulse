@@ -53,11 +53,8 @@ func TestAcquireDaemonInstanceSecondFails(t *testing.T) {
 		t.Fatalf("pid record = %+v", record)
 	}
 
-	// Second acquire in another logical instance must fail.
-	// Note: same-process second flock may behave differently on some OS;
-	// we primarily assert the live-PID path by writing our PID (already done).
-	// 第二次获取必须失败。
-	// 注：同进程二次 flock 在部分 OS 上行为不同；此处已写入存活 PID，走 isProcessRunning 路径。
+	// Second acquire must fail while the first holds the exclusive PID lock.
+	// 第一个实例持有排他锁时，第二次获取必须失败。
 	_, err = acquireDaemonInstance(pidPath, api)
 	if err == nil {
 		t.Fatal("expected second acquire to fail")
@@ -171,9 +168,11 @@ func TestStopDaemonRequiresMatchingHealthIdentity(t *testing.T) {
 }
 
 func TestStopDaemonRefusesMismatchedOrUnavailableHealth(t *testing.T) {
+	// Use the current PID so "API unavailable" still refuses (process is alive).
+	// 使用当前 PID，使 “API 不可用” 仍拒绝停止（进程仍存活）。
 	path := filepath.Join(t.TempDir(), "bytepulse.pid")
 	record := daemonPIDRecord{
-		PID:        4321,
+		PID:        os.Getpid(),
 		InstanceID: "expected-instance",
 		APIAddr:    "127.0.0.1:8988",
 		StartedAt:  time.Now(),
@@ -201,7 +200,7 @@ func TestStopDaemonRefusesMismatchedOrUnavailableHealth(t *testing.T) {
 			},
 		},
 		{
-			name: "api unavailable",
+			name: "api unavailable process alive",
 			health: func(context.Context, string) (daemonclient.HealthResponse, error) {
 				return daemonclient.HealthResponse{}, context.DeadlineExceeded
 			},
@@ -209,6 +208,11 @@ func TestStopDaemonRefusesMismatchedOrUnavailableHealth(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// Rewrite PID file each subtest (stale cleanup may remove it).
+			// 每个子测试重写 PID 文件（过期清理可能已删除它）。
+			if err := writePIDRecordFile(path, record); err != nil {
+				t.Fatal(err)
+			}
 			signaled := false
 			err := stopDaemon(context.Background(), &cfg, tt.health, func(int) error {
 				signaled = true
@@ -221,6 +225,42 @@ func TestStopDaemonRefusesMismatchedOrUnavailableHealth(t *testing.T) {
 				t.Fatal("must not signal an unverified process")
 			}
 		})
+	}
+}
+
+func TestStopDaemonRemovesStalePIDWhenProcessGone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bytepulse.pid")
+	// Use a PID that is extremely unlikely to be alive.
+	// 使用几乎不可能存活的 PID。
+	record := daemonPIDRecord{
+		PID:        1<<30 - 3,
+		InstanceID: "stale-instance",
+		APIAddr:    "127.0.0.1:8988",
+		StartedAt:  time.Now(),
+	}
+	if isProcessRunning(record.PID) {
+		t.Skip("stale PID unexpectedly alive on this host")
+	}
+	if err := writePIDRecordFile(path, record); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.PIDPath = path
+
+	err := stopDaemon(context.Background(), &cfg,
+		func(context.Context, string) (daemonclient.HealthResponse, error) {
+			return daemonclient.HealthResponse{}, context.DeadlineExceeded
+		},
+		func(int) error {
+			t.Fatal("must not signal when process is gone")
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("stale PID file should be removed, stat err=%v", err)
 	}
 }
 

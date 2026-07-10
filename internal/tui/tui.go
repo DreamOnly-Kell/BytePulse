@@ -215,8 +215,8 @@ func (m *model) refreshTraffic(now time.Time) {
 	m.err = nil
 	latest, err := m.store.LatestAggregateSample(m.cfg.Interface)
 	if err != nil {
-		// Stop early; process refresh is skipped when interface data fails.
-		// 提前返回；网卡数据失败时跳过进程刷新。
+		// Interface read failed; process refresh already ran independently above.
+		// 网卡读取失败；进程刷新已在上方独立执行。
 		m.err = err
 		return
 	}

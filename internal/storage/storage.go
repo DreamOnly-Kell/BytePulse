@@ -46,10 +46,10 @@ type Sample struct {
 // SummaryResult is a range total used by report/CLI/web summary APIs.
 // SummaryResult 是 report/CLI/web 汇总 API 使用的区间合计。
 type SummaryResult struct {
-	Start       time.Time `json:"start"`
-	End         time.Time `json:"end"`
-	RXBytes     uint64    `json:"rx_bytes"`
-	TXBytes     uint64    `json:"tx_bytes"`
+	Start   time.Time `json:"start"`
+	End     time.Time `json:"end"`
+	RXBytes uint64    `json:"rx_bytes"`
+	TXBytes uint64    `json:"tx_bytes"`
 	// DurationSec is the requested window length (end-start), not busy time.
 	// DurationSec 是请求窗口长度（end-start），不是繁忙时间。
 	DurationSec float64 `json:"duration_sec"`
@@ -79,10 +79,10 @@ type ProcessConnectionMinute struct {
 // ProcessConnectionSummary is a historical top-process query row.
 // ProcessConnectionSummary 是历史进程排行查询的一行。
 type ProcessConnectionSummary struct {
-	PID         int       `json:"pid"`
-	ProcessName string    `json:"process_name"`
-	ProcessPath string    `json:"process_path"`
-	ProcessKey  string    `json:"process_key"`
+	PID         int    `json:"pid"`
+	ProcessName string `json:"process_name"`
+	ProcessPath string `json:"process_path"`
+	ProcessKey  string `json:"process_key"`
 	// ConnectionCount is the peak concurrent socket count in the range
 	// (MAX of max_connection_count). Matches the CONNS column semantics.
 	// ConnectionCount 是区间内峰值并发套接字数（max_connection_count 的 MAX）。
@@ -141,9 +141,9 @@ func (s SummaryResult) AvgTotalBps() float64 {
 // Bucket is an hourly/daily aggregation cell.
 // Bucket 是小时/日聚合单元。
 type Bucket struct {
-	Start       time.Time `json:"start"`
-	RXBytes     uint64    `json:"rx_bytes"`
-	TXBytes     uint64    `json:"tx_bytes"`
+	Start   time.Time `json:"start"`
+	RXBytes uint64    `json:"rx_bytes"`
+	TXBytes uint64    `json:"tx_bytes"`
 	// DurationSec is the overlap of this bucket with the query window.
 	// DurationSec 是本桶与查询窗口的重叠秒数。
 	DurationSec float64 `json:"duration_sec"`

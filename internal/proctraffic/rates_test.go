@@ -11,9 +11,9 @@ func TestComputeRateSamplesUsesDeltas(t *testing.T) {
 		2: {RX: 50, TX: 10},
 	}
 	curr := map[int]pidByteCounters{
-		1: {RX: 3000, TX: 700},  // +2000 / +500
-		2: {RX: 50, TX: 10},     // idle
-		3: {RX: 100, TX: 100},   // first seen → skip
+		1: {RX: 3000, TX: 700}, // +2000 / +500
+		2: {RX: 50, TX: 10},    // idle
+		3: {RX: 100, TX: 100},  // first seen → skip
 	}
 	meta := map[int]processMeta{
 		1: {name: "chrome", path: `C:\chrome.exe`},

@@ -133,8 +133,8 @@ func (c *ProcessConnectionCollector) Run(ctx context.Context) error {
 // sampleOnce takes one connection snapshot and may flush completed minutes.
 // sampleOnce 取一次连接快照，并可能刷写已完成分钟。
 func (c *ProcessConnectionCollector) sampleOnce(now time.Time) error {
-	// Platform sampler returns ErrNotSupported on Linux/Windows stubs.
-	// 平台采样器在 Linux/Windows stub 上返回 ErrNotSupported。
+	// Platform sampler returns ErrNotSupported on platforms without process discovery (e.g. Linux).
+	// 平台采样器在无进程发现的平台（如 Linux）上返回 ErrNotSupported。
 	conns, err := c.sampler.Sample()
 	if errors.Is(err, proc.ErrNotSupported) {
 		return errProcessConnectionUnsupported

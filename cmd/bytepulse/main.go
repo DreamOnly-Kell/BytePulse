@@ -592,6 +592,16 @@ func stopDaemon(ctx context.Context, cfg *config.Config, health daemonHealthFunc
 	defer cancel()
 	info, err := health(checkCtx, record.APIAddr)
 	if err != nil {
+		// Process gone: drop stale PID file so the next start/stop is not blocked.
+		// 进程已不在：清理过期 PID 文件，避免后续 start/stop 被卡住。
+		if !isProcessRunning(record.PID) {
+			if rmErr := removePIDFile(cfg.PIDPath); rmErr != nil {
+				return fmt.Errorf("daemon not running (pid %d) but failed to remove stale PID file: %w", record.PID, rmErr)
+			}
+			fmt.Printf("bytepulse daemon not running; removed stale PID file (pid=%d)\n", record.PID)
+			logx.Info("removed stale pid file", "component", "cli", "pid", record.PID, "path", cfg.PIDPath)
+			return nil
+		}
 		return fmt.Errorf("refusing to stop pid %d: daemon identity could not be verified: %w", record.PID, err)
 	}
 	if info.PID != record.PID || info.InstanceID != record.InstanceID {

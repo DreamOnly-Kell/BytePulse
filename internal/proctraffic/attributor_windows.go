@@ -30,10 +30,10 @@ const (
 )
 
 var (
-	modIphlpapi                  = windows.NewLazySystemDLL("iphlpapi.dll")
-	procGetExtendedTcpTable      = modIphlpapi.NewProc("GetExtendedTcpTable")
-	procGetPerTcpConnectionEStats = modIphlpapi.NewProc("GetPerTcpConnectionEStats")
-	procSetPerTcpConnectionEStats = modIphlpapi.NewProc("SetPerTcpConnectionEStats")
+	modIphlpapi                    = windows.NewLazySystemDLL("iphlpapi.dll")
+	procGetExtendedTcpTable        = modIphlpapi.NewProc("GetExtendedTcpTable")
+	procGetPerTcpConnectionEStats  = modIphlpapi.NewProc("GetPerTcpConnectionEStats")
+	procSetPerTcpConnectionEStats  = modIphlpapi.NewProc("SetPerTcpConnectionEStats")
 	procGetPerTcp6ConnectionEStats = modIphlpapi.NewProc("GetPerTcp6ConnectionEStats")
 	procSetPerTcp6ConnectionEStats = modIphlpapi.NewProc("SetPerTcp6ConnectionEStats")
 )
