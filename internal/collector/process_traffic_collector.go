@@ -5,6 +5,7 @@ package collector
 import (
 	"context"
 	"errors"
+	"time"
 
 	"bytepulse/internal/logx"
 	"bytepulse/internal/processstate"
@@ -37,6 +38,7 @@ func (c *ProcessTrafficCollector) Run(ctx context.Context) error {
 		return nil
 	}
 	logx.Info("process traffic collector started", "component", "proctraffic")
+	c.state.SetTrafficBackendStatus(processstate.TrafficBackendStatus{State: processstate.TrafficBackendStarting})
 	// Feed each batch of samples into shared process memory state.
 	// 将每批样本写入共享进程内存态。
 	err := c.attributor.Run(ctx, func(samples []proctraffic.Sample) {
@@ -60,10 +62,28 @@ func (c *ProcessTrafficCollector) Run(ctx context.Context) error {
 			"max_tx_bps", maxTX,
 			"source", samples[0].Source,
 		)
+		lastSampleAt := samples[0].SeenAt
+		for _, sample := range samples[1:] {
+			if sample.SeenAt.After(lastSampleAt) {
+				lastSampleAt = sample.SeenAt
+			}
+		}
+		if lastSampleAt.IsZero() {
+			lastSampleAt = time.Now()
+		}
 		c.state.UpdateTraffic(trafficSamplesToState(samples))
+		c.state.SetTrafficBackendStatus(processstate.TrafficBackendStatus{
+			State:        processstate.TrafficBackendHealthy,
+			LastSampleAt: lastSampleAt,
+		})
 	})
 	if err != nil && !errors.Is(err, context.Canceled) {
 		logx.Warn("process traffic attributor stopped", "component", "proctraffic", "err", err)
+		c.state.ClearTraffic()
+		c.state.SetTrafficBackendStatus(processstate.TrafficBackendStatus{
+			State:     processstate.TrafficBackendDegraded,
+			LastError: err.Error(),
+		})
 		return nil
 	}
 	logx.Info("process traffic collector stopped", "component", "proctraffic")

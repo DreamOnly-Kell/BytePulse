@@ -47,6 +47,25 @@ func TestClientHealthReturnsErrorOnNonOKStatus(t *testing.T) {
 	}
 }
 
+func TestClientHealthInfoDecodesIdentity(t *testing.T) {
+	client := New("http://bytepulse.test")
+	client.HTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"pid":2468,"instance_id":"instance-2468"}`)),
+			Request:    r,
+		}, nil
+	})}
+	got, err := client.HealthInfo(context.Background())
+	if err != nil {
+		t.Fatalf("health info: %v", err)
+	}
+	if !got.OK || got.PID != 2468 || got.InstanceID != "instance-2468" {
+		t.Fatalf("health=%+v", got)
+	}
+}
+
 func TestClientUsesHTTPPrefixForPlainAddr(t *testing.T) {
 	client := New("127.0.0.1:8988")
 	if !strings.HasPrefix(client.BaseURL, "http://") {

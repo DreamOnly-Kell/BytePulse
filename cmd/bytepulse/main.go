@@ -212,7 +212,10 @@ func newDaemonCommand(cfg *config.Config) *cobra.Command {
 			)
 			// Local HTTP API for realtime process views.
 			// 进程实时视图使用的本机 HTTP API。
-			api := daemonapi.NewServer(procState, store, *cfg)
+			api := daemonapi.NewServer(procState, store, *cfg, daemonapi.Identity{
+				PID:        inst.record.PID,
+				InstanceID: inst.record.InstanceID,
+			})
 			apiServer := &http.Server{
 				Addr:    cfg.DaemonAPIAddr,
 				Handler: api.Handler(),
@@ -228,6 +231,7 @@ func newDaemonCommand(cfg *config.Config) *cobra.Command {
 			// Buffered error channel from background workers (API + collectors).
 			// 后台 worker（API + 采集器）共用的带缓冲错误通道。
 			errCh := make(chan error, 3)
+			processDone := make(chan error, 1)
 			// Serve the daemon API until shutdown.
 			// 提供 daemon API 直到关闭。
 			go func() {
@@ -246,7 +250,9 @@ func newDaemonCommand(cfg *config.Config) *cobra.Command {
 			// Run process connection sampling loop.
 			// 运行进程连接采样循环。
 			go func() {
-				if err := pc.Run(runCtx); err != nil {
+				err := pc.Run(runCtx)
+				processDone <- err
+				if err != nil {
 					errCh <- fmt.Errorf("process collector: %w", err)
 				}
 			}()
@@ -287,6 +293,14 @@ func newDaemonCommand(cfg *config.Config) *cobra.Command {
 				// 协作式停止采集器。
 				cancel()
 				logx.Info("daemon shutting down", "component", "daemon", "reason", "signal")
+				select {
+				case err := <-processDone:
+					if err != nil {
+						return fmt.Errorf("process collector shutdown: %w", err)
+					}
+				case <-time.After(2 * time.Second):
+					return fmt.Errorf("process collector shutdown timed out")
+				}
 				// Give HTTP server a short window to drain.
 				// 给 HTTP 服务短暂时间排空连接。
 				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -298,6 +312,11 @@ func newDaemonCommand(cfg *config.Config) *cobra.Command {
 				// 清理后向上返回第一个 worker 错误。
 				logx.Error("daemon worker failed", "component", "daemon", "err", err)
 				cancel()
+				select {
+				case <-processDone:
+				case <-time.After(2 * time.Second):
+					logx.Warn("process collector shutdown timed out", "component", "daemon")
+				}
 				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
 				defer shutdownCancel()
 				_ = apiServer.Shutdown(shutdownCtx)
@@ -538,41 +557,52 @@ func newStopCommand(cfg *config.Config) *cobra.Command {
 		Use:   "stop",
 		Short: "Stop daemon via PID file / 通过 PID 文件停止 daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Load PID written by `daemon`.
-			// 读取 `daemon` 写入的 PID。
-			pid, err := readPIDFile(cfg.PIDPath)
-			if err != nil {
-				logx.Error("read pid file failed", "component", "cli", "path", cfg.PIDPath, "err", err)
-				return err
-			}
-			logx.Info("stopping daemon", "component", "cli", "pid", pid, "path", cfg.PIDPath)
-			// Resolve an os.Process handle (Unix: always succeeds for any pid).
-			// 解析 os.Process 句柄（Unix：任意 pid 通常都能“找到”）。
-			proc, err := os.FindProcess(pid)
-			if err != nil {
-				logx.Error("find process failed", "component", "cli", "pid", pid, "err", err)
-				return err
-			}
-			// Prefer graceful SIGINT so collectors can flush/shutdown.
-			// 优先优雅 SIGINT，便于采集器刷盘/关闭。
-			if err := proc.Signal(os.Interrupt); err != nil {
-				logx.Warn("interrupt signal failed, trying kill", "component", "cli", "pid", pid, "err", err)
-				// Fall back to Kill if Interrupt fails.
-				// Interrupt 失败则回退 Kill。
-				if killErr := proc.Kill(); killErr != nil {
-					logx.Error("kill process failed", "component", "cli", "pid", pid, "err", killErr)
-					return fmt.Errorf("failed to stop pid %d: interrupt error: %v; kill error: %v", pid, err, killErr)
-				}
-			}
-			// Best-effort cleanup of the PID file after signaling.
-			// 发信号后尽力清理 PID 文件。
-			_ = removePIDFile(cfg.PIDPath)
-			fmt.Printf("bytepulse daemon stopped, pid=%d\n", pid)
-			logx.Info("stop signal sent", "component", "cli", "pid", pid)
-			return nil
+			return stopDaemon(cmd.Context(), cfg, fetchDaemonHealth, signalDaemonInterrupt)
 		},
 	}
 	return cmd
+}
+
+type daemonHealthFunc func(context.Context, string) (daemonclient.HealthResponse, error)
+type daemonSignalFunc func(int) error
+
+func fetchDaemonHealth(ctx context.Context, addr string) (daemonclient.HealthResponse, error) {
+	return daemonclient.New(addr).HealthInfo(ctx)
+}
+
+func signalDaemonInterrupt(pid int) error {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	if err := proc.Signal(os.Interrupt); err != nil {
+		// Windows does not implement os.Interrupt for arbitrary processes.
+		// Identity was verified before this function is called, so Kill remains safe.
+		return proc.Kill()
+	}
+	return nil
+}
+
+func stopDaemon(ctx context.Context, cfg *config.Config, health daemonHealthFunc, signal daemonSignalFunc) error {
+	record, err := readPIDRecord(cfg.PIDPath)
+	if err != nil {
+		return err
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	info, err := health(checkCtx, record.APIAddr)
+	if err != nil {
+		return fmt.Errorf("refusing to stop pid %d: daemon identity could not be verified: %w", record.PID, err)
+	}
+	if info.PID != record.PID || info.InstanceID != record.InstanceID {
+		return fmt.Errorf("refusing to stop pid %d: daemon identity does not match PID file", record.PID)
+	}
+	if err := signal(record.PID); err != nil {
+		return fmt.Errorf("failed to interrupt pid %d: %w", record.PID, err)
+	}
+	fmt.Printf("bytepulse daemon stop signal sent, pid=%d\n", record.PID)
+	logx.Info("stop signal sent", "component", "cli", "pid", record.PID)
+	return nil
 }
 
 // newStatusCommand prints the latest aggregated interface speeds from SQLite.

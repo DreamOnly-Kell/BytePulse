@@ -41,6 +41,10 @@ func TestProcessTrafficCollectorUpdatesState(t *testing.T) {
 	for {
 		summaries := state.LatestSummaries(10)
 		if len(summaries) == 1 && summaries[0].TrafficAvailable {
+			status := state.TrafficBackendStatus()
+			if status.State != processstate.TrafficBackendHealthy || status.LastSampleAt.IsZero() {
+				t.Fatalf("status=%+v", status)
+			}
 			cancel()
 			if err := <-done; err != nil {
 				t.Fatalf("run: %v", err)
@@ -65,8 +69,20 @@ func TestProcessTrafficCollectorUnsupportedReturnsNil(t *testing.T) {
 }
 
 func TestProcessTrafficCollectorOtherErrorReturnsNil(t *testing.T) {
-	collector := NewProcessTrafficCollector(fakeTrafficAttributor{err: errors.New("nettop failed")}, processstate.New())
+	state := processstate.New()
+	now := time.Now()
+	state.Update([]proc.Connection{{PID: 1, ProcessName: "curl", ProcessKey: "1:1", SeenAt: now}}, now)
+	state.UpdateTraffic([]processstate.ProcessTrafficSample{{PID: 1, RXBps: 10, SeenAt: now, Source: "nettop"}})
+	collector := NewProcessTrafficCollector(fakeTrafficAttributor{err: errors.New("nettop failed")}, state)
 	if err := collector.Run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
+	}
+	status := state.TrafficBackendStatus()
+	if status.State != processstate.TrafficBackendDegraded || status.LastError != "nettop failed" {
+		t.Fatalf("status=%+v", status)
+	}
+	got := state.LatestSummaries(1)
+	if len(got) != 1 || got[0].TrafficAvailable {
+		t.Fatalf("stale traffic was not cleared: %+v", got)
 	}
 }

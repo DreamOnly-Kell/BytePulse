@@ -44,10 +44,11 @@ type ProcessConnectionOptions struct {
 // ProcessConnectionCollector samples sockets, updates memory state, flushes minutes.
 // ProcessConnectionCollector 采样套接字、更新内存态、刷写分钟数据。
 type ProcessConnectionCollector struct {
-	store   ProcessConnectionStore
-	sampler proc.ConnectionSampler
-	state   *processstate.State
-	opts    ProcessConnectionOptions
+	store       ProcessConnectionStore
+	sampler     proc.ConnectionSampler
+	state       *processstate.State
+	opts        ProcessConnectionOptions
+	nextCleanup time.Time
 }
 
 // errProcessConnectionUnsupported is the internal sentinel for platform stubs.
@@ -89,6 +90,9 @@ func (c *ProcessConnectionCollector) Run(ctx context.Context) error {
 		"exclude_self", c.opts.ExcludeSelf,
 		"self_pid", c.opts.SelfPID,
 	)
+	if err := c.cleanupIfDue(time.Now()); err != nil {
+		return err
+	}
 	// Prime memory state before waiting for the first tick.
 	// 在等待第一拍前先填充内存态。
 	if err := c.sampleOnce(time.Now()); err != nil {
@@ -108,9 +112,9 @@ func (c *ProcessConnectionCollector) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			// On shutdown, flush any completed minute buckets still in memory.
-			// 关闭时刷写内存中已完成的分钟桶。
-			return flushProcessMinutes(c.store, c.state, time.Now(), c.opts.Retention)
+			// On shutdown, persist the current partial minute as well.
+			// 关闭时也持久化当前未完成分钟。
+			return flushAllProcessMinutes(c.store, c.state)
 		case now := <-ticker.C:
 			if err := c.sampleOnce(now); err != nil {
 				// Platform became unsupported mid-run (unlikely) → stop quietly.
@@ -157,18 +161,33 @@ func (c *ProcessConnectionCollector) sampleOnce(now time.Time) error {
 	c.state.Update(conns, now)
 	// Persist any minute buckets that are no longer the current minute.
 	// 持久化已不再是“当前分钟”的分钟桶。
-	return flushProcessMinutes(c.store, c.state, now, c.opts.Retention)
+	if err := flushProcessMinutes(c.store, c.state, now); err != nil {
+		return err
+	}
+	return c.cleanupIfDue(now)
 }
 
-// flushProcessMinutes writes completed rollups and runs retention cleanup.
-// flushProcessMinutes 写入已完成聚合并执行保留期清理。
-func flushProcessMinutes(store ProcessConnectionStore, state *processstate.State, now time.Time, retention time.Duration) error {
+// flushProcessMinutes writes completed rollups.
+// flushProcessMinutes 写入已完成聚合。
+func flushProcessMinutes(store ProcessConnectionStore, state *processstate.State, now time.Time) error {
 	// Pull completed (previous) minutes out of memory.
 	// 从内存取出已完成（过去）的分钟。
 	minutes := state.FlushCompleted(now)
 	if len(minutes) == 0 {
 		return nil
 	}
+	return persistProcessMinutes(store, state, minutes)
+}
+
+func flushAllProcessMinutes(store ProcessConnectionStore, state *processstate.State) error {
+	minutes := state.DrainAllMinutes()
+	if len(minutes) == 0 {
+		return nil
+	}
+	return persistProcessMinutes(store, state, minutes)
+}
+
+func persistProcessMinutes(store ProcessConnectionStore, state *processstate.State, minutes []processstate.ProcessConnectionMinute) error {
 	// Convert processstate types into storage types.
 	// 将 processstate 类型转换为 storage 类型。
 	items := make([]storage.ProcessConnectionMinute, 0, len(minutes))
@@ -178,17 +197,24 @@ func flushProcessMinutes(store ProcessConnectionStore, state *processstate.State
 	// Upsert merged stats for each (minute_start, process_key).
 	// 按 (minute_start, process_key) upsert 合并统计。
 	if err := store.UpsertProcessConnectionMinutes(items); err != nil {
+		state.RestoreMinutes(minutes)
 		logx.Error("flush process minutes failed", "component", "proc", "err", err, "rows", len(items))
 		return err
 	}
 	logx.Info("flushed process connection minutes", "component", "proc", "rows", len(items))
-	// Delete expired historical process minutes.
-	// 删除过期的历史进程分钟数据。
-	if err := store.CleanupProcessConnectionMinutes(now, retention); err != nil {
+	return nil
+}
+
+func (c *ProcessConnectionCollector) cleanupIfDue(now time.Time) error {
+	if !c.nextCleanup.IsZero() && now.Before(c.nextCleanup) {
+		return nil
+	}
+	c.nextCleanup = now.Add(cleanupInterval)
+	if err := c.store.CleanupProcessConnectionMinutes(now, c.opts.Retention); err != nil {
 		logx.Error("cleanup process minutes failed", "component", "proc", "err", err)
 		return err
 	}
-	logx.Debug("process minutes cleanup ok", "component", "proc", "retention", retention.String())
+	logx.Debug("process minutes cleanup ok", "component", "proc", "retention", c.opts.Retention.String())
 	return nil
 }
 

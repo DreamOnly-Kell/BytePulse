@@ -19,12 +19,23 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+type trafficStore interface {
+	LatestAggregateSample(string) (storage.Sample, error)
+	Summary(time.Time, time.Time, string) (storage.SummaryResult, error)
+	RecentSeries(time.Time, time.Time, string) ([]storage.Sample, error)
+}
+
+type processAPIClient interface {
+	Health(context.Context) error
+	Processes(context.Context, int) ([]processstate.ProcessConnectionSummary, error)
+}
+
 // model is the Bubbletea application state refreshed once per second.
 // model 是每秒刷新一次的 Bubbletea 应用状态。
 type model struct {
 	// store provides SQLite reads for interface stats.
 	// store 提供网卡统计的 SQLite 读取。
-	store *storage.Store
+	store trafficStore
 	// cfg holds interface filter, bits mode, TopN, daemon API addr.
 	// cfg 持有网卡过滤、bits 模式、TopN、daemon API 地址。
 	cfg config.Config
@@ -49,7 +60,7 @@ type model struct {
 	loaded bool
 	// processClient talks to the daemon API for process rows.
 	// processClient 通过 daemon API 获取进程行。
-	processClient *daemonclient.Client
+	processClient processAPIClient
 	// procs is the latest realtime process list.
 	// procs 是最新实时进程列表。
 	procs []processstate.ProcessConnectionSummary
@@ -166,26 +177,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // refresh loads interface stats from SQLite and processes from the daemon API.
 // refresh 从 SQLite 加载网卡统计，从 daemon API 加载进程。
 func (m *model) refresh() {
+	m.refreshProcesses(context.Background())
+	m.refreshTraffic(time.Now())
+}
+
+func (m *model) refreshProcesses(ctx context.Context) {
 	// Probe daemon health every tick until it is up (then keep probing lightly).
 	// 每拍探测 daemon health，起来之后仍会每拍检查。
 	if m.processClient != nil {
-		if err := m.processClient.Health(context.Background()); err != nil {
+		if err := m.processClient.Health(ctx); err != nil {
 			m.daemonOK = false
 			m.processErr = err
-			m.procs = nil
 			m.waitTicks++
-		} else {
-			if !m.daemonOK {
-				m.waitTicks = 0
-			}
-			m.daemonOK = true
-			m.processErr = nil
+			return
 		}
+		if !m.daemonOK {
+			m.waitTicks = 0
+		}
+		m.daemonOK = true
+		procs, err := m.processClient.Processes(ctx, m.cfg.TopN)
+		if err != nil {
+			m.processErr = err
+			return
+		}
+		m.procs = procs
+		m.processErr = nil
 	}
+}
 
-	// While daemon is down, stay on the wait screen (still allow quit).
-	// daemon 未启动时停留在等待屏（仍可退出）。
-	if !m.daemonOK {
+func (m *model) refreshTraffic(now time.Time) {
+	if m.store == nil {
 		return
 	}
 
@@ -202,7 +223,6 @@ func (m *model) refresh() {
 	m.latest = latest
 	m.loaded = true
 
-	now := time.Now()
 	// Fill each traffic window summary from SQLite.
 	// 从 SQLite 填充每个流量窗口汇总。
 	for i := range m.ranges {
@@ -228,19 +248,6 @@ func (m *model) refresh() {
 	}
 	m.series = series
 
-	// Process list from daemon API.
-	// 从 daemon API 拉进程列表。
-	if m.processClient != nil {
-		procs, err := m.processClient.Processes(context.Background(), m.cfg.TopN)
-		if err != nil {
-			m.procs = nil
-			m.processErr = err
-			m.daemonOK = false
-		} else {
-			m.procs = procs
-			m.processErr = nil
-		}
-	}
 }
 
 // View renders either the process table or the main traffic dashboard.
@@ -248,7 +255,7 @@ func (m *model) refresh() {
 func (m model) View() string {
 	// Full-screen wait until background collector is healthy.
 	// 后台采集就绪前全屏等待。
-	if !m.daemonOK {
+	if m.showProc && !m.daemonOK {
 		return m.waitDaemonView()
 	}
 

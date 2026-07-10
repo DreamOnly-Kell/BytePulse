@@ -4,6 +4,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -24,8 +27,18 @@ var errPIDLocked = errors.New("pid file already locked")
 // daemonInstance holds an exclusive lock on the daemon PID file for the process lifetime.
 // daemonInstance 在进程生命周期内持有 daemon PID 文件的排他锁。
 type daemonInstance struct {
-	file *os.File
-	path string
+	file   *os.File
+	path   string
+	record daemonPIDRecord
+}
+
+// daemonPIDRecord binds a PID to one daemon lifetime and API endpoint.
+// daemonPIDRecord 将 PID 绑定到一个 daemon 生命周期及其 API 地址。
+type daemonPIDRecord struct {
+	PID        int       `json:"pid"`
+	InstanceID string    `json:"instance_id"`
+	APIAddr    string    `json:"api_addr"`
+	StartedAt  time.Time `json:"started_at"`
 }
 
 // acquireDaemonInstance enforces a single daemon per PID file (and refuses if the API is already healthy).
@@ -37,14 +50,6 @@ func acquireDaemonInstance(pidPath, apiAddr string) (*daemonInstance, error) {
 	// 若已有 daemon 在 API 上响应，即使 PID 路径不同也拒绝（避免双采集）。
 	if daemonAPIHealthy(apiAddr) {
 		pid := readPIDFileLoose(pidPath)
-		return nil, alreadyRunningError(pid, apiAddr)
-	}
-
-	// Stale PID file (process gone): allow replace after we take the lock.
-	// 过期 PID 文件（进程已不在）：拿到锁后允许覆盖。
-	if pid, err := readPIDFile(pidPath); err == nil && isProcessRunning(pid) {
-		// Live process recorded in the PID file — refuse before racing on the lock.
-		// PID 文件记录的进程仍存活 — 在抢锁前直接拒绝。
 		return nil, alreadyRunningError(pid, apiAddr)
 	}
 
@@ -72,15 +77,27 @@ func acquireDaemonInstance(pidPath, apiAddr string) (*daemonInstance, error) {
 		return nil, err
 	}
 
+	instanceID, err := newInstanceID()
+	if err != nil {
+		_ = unlockPIDFile(f)
+		_ = f.Close()
+		return nil, err
+	}
+	record := daemonPIDRecord{
+		PID:        os.Getpid(),
+		InstanceID: instanceID,
+		APIAddr:    apiAddr,
+		StartedAt:  time.Now().UTC(),
+	}
 	// We own the lock. Record our PID for `bytepulse stop`.
 	// 已持有锁。写入自身 PID 供 `bytepulse stop` 使用。
-	if err := writePIDToFile(f); err != nil {
+	if err := writePIDRecordToFile(f, record); err != nil {
 		_ = unlockPIDFile(f)
 		_ = f.Close()
 		return nil, err
 	}
 
-	return &daemonInstance{file: f, path: pidPath}, nil
+	return &daemonInstance{file: f, path: pidPath, record: record}, nil
 }
 
 // Release unlocks and removes the PID file. Safe to call once; further calls no-op.
@@ -100,49 +117,60 @@ func (d *daemonInstance) Release() error {
 	return nil
 }
 
-// writePIDToFile truncates the locked PID file and writes the current process ID.
-// writePIDToFile 截断已锁定的 PID 文件并写入当前进程 ID。
-func writePIDToFile(f *os.File) error {
+// writePIDRecordToFile truncates a locked PID file and writes structured identity.
+// writePIDRecordToFile 截断已锁定的 PID 文件并写入结构化实例身份。
+func writePIDRecordToFile(f *os.File, record daemonPIDRecord) error {
 	if err := f.Truncate(0); err != nil {
 		return err
 	}
 	if _, err := f.Seek(0, 0); err != nil {
 		return err
 	}
-	_, err := f.WriteString(strconv.Itoa(os.Getpid()) + "\n")
-	if err != nil {
+	if err := json.NewEncoder(f).Encode(record); err != nil {
 		return err
 	}
 	return f.Sync()
 }
 
-// writePIDFile records the current process ID so `stop` can find the daemon.
-// Prefer acquireDaemonInstance for the daemon path (exclusive lock).
-// writePIDFile 将当前进程 PID 写入文件，供 `stop` 命令定位 daemon。
-// daemon 路径请优先使用 acquireDaemonInstance（带排他锁）。
-func writePIDFile(path string) error {
+func writePIDRecordFile(path string, record daemonPIDRecord) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	pid := []byte(strconv.Itoa(os.Getpid()) + "\n")
-	return os.WriteFile(path, pid, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return json.NewEncoder(f).Encode(record)
 }
 
-// readPIDFile loads and validates a daemon PID from disk.
-// readPIDFile 从磁盘读取并校验 daemon 的 PID。
-func readPIDFile(path string) (int, error) {
-	data, err := os.ReadFile(path)
+// readPIDRecord loads and validates a daemon identity from disk.
+// readPIDRecord 从磁盘读取并校验 daemon 实例身份。
+func readPIDRecord(path string) (daemonPIDRecord, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return 0, fmt.Errorf("daemon PID file not found at %s", path)
+			return daemonPIDRecord{}, fmt.Errorf("daemon PID file not found at %s", path)
 		}
+		return daemonPIDRecord{}, err
+	}
+	defer f.Close()
+	var record daemonPIDRecord
+	if err := json.NewDecoder(f).Decode(&record); err != nil {
+		return daemonPIDRecord{}, fmt.Errorf("invalid daemon PID file at %s: %w", path, err)
+	}
+	if record.PID <= 0 || strings.TrimSpace(record.InstanceID) == "" || strings.TrimSpace(record.APIAddr) == "" || record.StartedAt.IsZero() {
+		return daemonPIDRecord{}, fmt.Errorf("invalid daemon PID file at %s", path)
+	}
+	return record, nil
+}
+
+func readPIDFile(path string) (int, error) {
+	record, err := readPIDRecord(path)
+	if err != nil {
 		return 0, err
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || pid <= 0 {
-		return 0, fmt.Errorf("invalid daemon PID file at %s", path)
-	}
-	return pid, nil
+	return record.PID, nil
 }
 
 // readPIDFileLoose returns a PID or 0 when missing/invalid (for error messages only).
@@ -153,6 +181,14 @@ func readPIDFileLoose(path string) int {
 		return 0
 	}
 	return pid
+}
+
+func newInstanceID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate daemon instance id: %w", err)
+	}
+	return hex.EncodeToString(raw[:]), nil
 }
 
 // removePIDFile deletes the PID file; ignoring "not found" is intentional.

@@ -14,9 +14,9 @@ import (
 // Sample is one process traffic observation from a nettop row.
 // Sample 是 nettop 一行对应的一条进程流量观测。
 type Sample struct {
-	PID         int       `json:"pid"`
-	ProcessName string    `json:"process_name"`
-	ProcessPath string    `json:"process_path"`
+	PID         int    `json:"pid"`
+	ProcessName string `json:"process_name"`
+	ProcessPath string `json:"process_path"`
 	// RXBytes / TXBytes are values from the nettop columns (often deltas with -d).
 	// RXBytes / TXBytes 来自 nettop 列（配合 -d 时常为增量）。
 	RXBytes uint64 `json:"rx_bytes"`
@@ -34,6 +34,10 @@ type Sample struct {
 // ParseNettopCSV parses a full CSV document (header + rows) into Samples.
 // ParseNettopCSV 将完整 CSV 文档（表头 + 行）解析为 Sample 列表。
 func ParseNettopCSV(r io.Reader, seenAt time.Time) ([]Sample, error) {
+	return parseNettopCSV(r, seenAt, time.Second)
+}
+
+func parseNettopCSV(r io.Reader, seenAt time.Time, elapsed time.Duration) ([]Sample, error) {
 	// Flexible field count: nettop columns vary by version/flags.
 	// 字段数灵活：nettop 列随版本/参数变化。
 	reader := csv.NewReader(r)
@@ -71,6 +75,10 @@ func ParseNettopCSV(r io.Reader, seenAt time.Time) ([]Sample, error) {
 		return []Sample{}, nil
 	}
 
+	seconds := elapsed.Seconds()
+	if seconds <= 0 {
+		seconds = 1
+	}
 	out := []Sample{}
 	for _, record := range records[1:] {
 		// Skip short/malformed rows.
@@ -100,12 +108,10 @@ func ParseNettopCSV(r io.Reader, seenAt time.Time) ([]Sample, error) {
 			ProcessPath: path,
 			RXBytes:     rx,
 			TXBytes:     tx,
-			// With 1s delta mode, byte delta ≈ bytes/sec.
-			// 在 1 秒增量模式下，字节增量 ≈ 字节/秒。
-			RXBps:  float64(rx),
-			TXBps:  float64(tx),
-			SeenAt: seenAt,
-			Source: "nettop",
+			RXBps:       float64(rx) / seconds,
+			TXBps:       float64(tx) / seconds,
+			SeenAt:      seenAt,
+			Source:      "nettop",
 		})
 	}
 	return out, nil

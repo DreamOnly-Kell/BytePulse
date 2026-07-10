@@ -14,7 +14,7 @@ A single **`daemon`** is the shared collector and in-memory process-state produc
 - Automatic rate units: `B/s`, `KB/s`, `MB/s`, `GB/s` (optional `--bits` for bits/s).
 - Rolling traffic summaries: `1h` … `15d`, plus hourly/daily aggregation APIs.
 - CLI, TUI, and local Web dashboard (shared daemon API for process views).
-- **Single daemon only:** exclusive PID-file lock; second start is blocked with a stop-then-start hint.
+- **Single daemon only:** exclusive PID-file lock and daemon instance identity; second start is blocked with a stop-then-start hint.
 - Per-interface filtering with `--interface`.
 - Process connection discovery (name, full path, PID, connection count, last seen).
 - Optional per-process RX/TX: macOS `nettop`, Windows TCP ESTATS (`--process-traffic auto`).
@@ -38,8 +38,9 @@ A single **`daemon`** is the shared collector and in-memory process-state produc
 ## Design notes (what BytePulse is not)
 
 - **Not a 24×7 background service by default.** The daemon is optional: run it while troubleshooting, then `stop`. Installers / `launchd` / systemd integration are optional future work, not required for normal use.
-- **One collector only (enforced).** `daemon` refuses a second start when: the PID file points at a live process, the PID file is exclusively locked, or the daemon API already answers `/api/health`. Message tells you to `bytepulse stop` first, then start again. Multiple viewers (TUI, Web, CLI) against one daemon are fine.
-- **No auto-start from TUI/Web.** If the daemon is down, TUI shows a wait screen; Web still serves NIC charts from SQLite but the process table waits; CLI process commands exit with a clear start hint.
+- **One collector only (enforced).** `daemon` refuses a second start when the PID file is exclusively locked or the configured daemon API already answers `/api/health`. An unlocked stale PID file is safely replaced, even if its old PID has been reused. Multiple viewers (TUI, Web, CLI) against one daemon are fine.
+- **Verified stop.** The PID file stores a random daemon instance ID. `bytepulse stop` signals the process only when `/api/health` returns the same PID and instance ID, preventing a stale PID file from stopping an unrelated process.
+- **No auto-start from TUI/Web.** If the daemon is down, the TUI traffic page and Web NIC charts can still read SQLite, while process views wait for the daemon; CLI process commands exit with a clear start hint.
 - **No packet capture** and **no always-on kernel agent** — OS counters and platform APIs only.
 - **Linux process monitoring** is out of scope for the current phase.
 
@@ -233,7 +234,7 @@ UI language (`lang` / `--lang`): `en` (default) or `zh` for TUI, Web labels, and
 ./bytepulse --lang zh tui
 ```
 
-**Daemon down behavior:** TUI stays on a wait/retry screen (start `bytepulse daemon` in another terminal). Web still serves NIC charts from SQLite; the process table shows a waiting message. CLI `processes` prints an error and a start command. Viewers never auto-start the daemon.
+**Daemon down behavior:** the TUI traffic page and Web NIC charts continue reading SQLite; process views show a wait/retry state. CLI `processes` prints an error and a start command. Viewers never auto-start the daemon.
 
 Hide BytePulse from process views (default is on). Matching uses the daemon PID and the executable name `bytepulse` / `bytepulse.exe`:
 
@@ -266,11 +267,11 @@ Default database path:
 
 BytePulse keeps up to 30 days of samples by default. The default collector interval is 1 second, but it can be changed with `daemon --interval`. Each interface sample stores timestamp, interface name, received bytes, transmitted bytes, receive speed, transmit speed, and sample interval.
 
-Process connection monitoring also samples every 1 second, but it does not write raw per-second connection snapshots to SQLite. The **daemon** keeps the latest process connection state **in memory** for realtime CLI / TUI / Web views and flushes **minute-level** process rollups to SQLite for historical process reports (`processes --range`, top APIs).
+Process connection monitoring also samples every 1 second, but it does not write raw per-second connection snapshots to SQLite. The **daemon** keeps the latest process connection state **in memory** for realtime CLI / TUI / Web views and flushes **minute-level** process rollups to SQLite for historical process reports (`processes --range`, top APIs). A clean shutdown also flushes the current partial minute. Retention cleanup runs at startup and then at most once per hour, rather than on every sample.
 
 Rolling summaries include samples by their sample timestamp. With the default 1-second interval, boundary error is at most about one sample interval. Daily buckets are currently grouped by Unix day boundaries.
 
-**Only one collector daemon may run at a time** (PID-file lock + live-PID check + API health). A second `daemon` exits with an error until you `bytepulse stop`. Multiple viewers against one daemon are fine. Default PID path:
+**Only one collector daemon may run at a time** for a configured PID file/API pair (PID-file lock + API health). The PID file also carries a random instance ID used to verify `bytepulse stop`. A second `daemon` exits with an error until you stop the first. Multiple viewers against one daemon are fine. Default PID path:
 
 ```text
 ~/.bytepulse/bytepulse.pid
@@ -307,6 +308,8 @@ GET /api/processes?limit=30
 GET /api/processes/connections?process_key=<key>
 GET /api/processes/top?range=24h&limit=30
 ```
+
+`/api/health` returns daemon identity plus the per-process traffic backend state (`disabled`, `starting`, `healthy`, or `degraded`).
 
 ## Roadmap
 

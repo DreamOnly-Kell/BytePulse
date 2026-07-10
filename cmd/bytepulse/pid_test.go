@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"bytepulse/internal/config"
+	"bytepulse/internal/daemonclient"
 	"bytepulse/internal/i18n"
 )
 
@@ -40,15 +43,14 @@ func TestAcquireDaemonInstanceSecondFails(t *testing.T) {
 	}
 	defer first.Release()
 
-	// PID file should contain our PID.
-	// PID 文件应包含当前进程 PID。
-	data, err := os.ReadFile(pidPath)
+	// PID file should contain our instance identity.
+	// PID 文件应包含当前实例身份。
+	record, err := readPIDRecord(pidPath)
 	if err != nil {
 		t.Fatalf("read pid: %v", err)
 	}
-	got, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || got != os.Getpid() {
-		t.Fatalf("pid file = %q, want %d", data, os.Getpid())
+	if record.PID != os.Getpid() || record.InstanceID == "" || record.APIAddr != api || record.StartedAt.IsZero() {
+		t.Fatalf("pid record = %+v", record)
 	}
 
 	// Second acquire in another logical instance must fail.
@@ -75,14 +77,16 @@ func TestAcquireDaemonInstanceReplacesStalePID(t *testing.T) {
 	pidPath := filepath.Join(dir, "bytepulse.pid")
 	api := "127.0.0.1:59998"
 
-	// Write a dead PID (no process).
-	// 写入一个已死的 PID（无对应进程）。
-	stale := []byte("2147483000\n")
-	if err := os.WriteFile(pidPath, stale, 0o644); err != nil {
-		t.Fatal(err)
+	// A stale unlocked record must be replaced even when its PID is currently alive.
+	// 即使旧记录的 PID 当前存活，只要文件未被锁定也必须可替换。
+	stale := daemonPIDRecord{
+		PID:        os.Getpid(),
+		InstanceID: "old-instance",
+		APIAddr:    api,
+		StartedAt:  time.Now().Add(-time.Hour),
 	}
-	if isProcessRunning(2147483000) {
-		t.Skip("stale PID unexpectedly alive on this host")
+	if err := writePIDRecordFile(pidPath, stale); err != nil {
+		t.Fatal(err)
 	}
 
 	inst, err := acquireDaemonInstance(pidPath, api)
@@ -91,13 +95,132 @@ func TestAcquireDaemonInstanceReplacesStalePID(t *testing.T) {
 	}
 	defer inst.Release()
 
-	data, err := os.ReadFile(pidPath)
+	record, err := readPIDRecord(pidPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, _ := strconv.Atoi(strings.TrimSpace(string(data)))
-	if got != os.Getpid() {
-		t.Fatalf("pid = %d, want %d", got, os.Getpid())
+	if record.PID != os.Getpid() || record.InstanceID == stale.InstanceID {
+		t.Fatalf("record = %+v", record)
+	}
+}
+
+func TestPIDRecordRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bytepulse.pid")
+	want := daemonPIDRecord{
+		PID:        1234,
+		InstanceID: "instance-123",
+		APIAddr:    "127.0.0.1:8988",
+		StartedAt:  time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC),
+	}
+	if err := writePIDRecordFile(path, want); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, err := readPIDRecord(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got != want {
+		t.Fatalf("got=%+v want=%+v", got, want)
+	}
+}
+
+func TestReadPIDRecordRejectsLegacyOrIncompleteContent(t *testing.T) {
+	for _, content := range []string{
+		"1234\n",
+		`{"pid":1234}`,
+		`{"pid":1234,"instance_id":"x","api_addr":"127.0.0.1:8988"}`,
+	} {
+		path := filepath.Join(t.TempDir(), "bytepulse.pid")
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readPIDRecord(path); err == nil {
+			t.Fatalf("content %q should be rejected", content)
+		}
+	}
+}
+
+func TestStopDaemonRequiresMatchingHealthIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bytepulse.pid")
+	record := daemonPIDRecord{
+		PID:        4321,
+		InstanceID: "expected-instance",
+		APIAddr:    "127.0.0.1:8988",
+		StartedAt:  time.Now(),
+	}
+	if err := writePIDRecordFile(path, record); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.PIDPath = path
+
+	var signaled int
+	health := func(context.Context, string) (daemonclient.HealthResponse, error) {
+		return daemonclient.HealthResponse{OK: true, PID: record.PID, InstanceID: record.InstanceID}, nil
+	}
+	signal := func(pid int) error {
+		signaled = pid
+		return nil
+	}
+	if err := stopDaemon(context.Background(), &cfg, health, signal); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if signaled != record.PID {
+		t.Fatalf("signaled=%d want=%d", signaled, record.PID)
+	}
+}
+
+func TestStopDaemonRefusesMismatchedOrUnavailableHealth(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bytepulse.pid")
+	record := daemonPIDRecord{
+		PID:        4321,
+		InstanceID: "expected-instance",
+		APIAddr:    "127.0.0.1:8988",
+		StartedAt:  time.Now(),
+	}
+	if err := writePIDRecordFile(path, record); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.PIDPath = path
+
+	tests := []struct {
+		name   string
+		health func(context.Context, string) (daemonclient.HealthResponse, error)
+	}{
+		{
+			name: "instance mismatch",
+			health: func(context.Context, string) (daemonclient.HealthResponse, error) {
+				return daemonclient.HealthResponse{OK: true, PID: record.PID, InstanceID: "other"}, nil
+			},
+		},
+		{
+			name: "pid mismatch",
+			health: func(context.Context, string) (daemonclient.HealthResponse, error) {
+				return daemonclient.HealthResponse{OK: true, PID: record.PID + 1, InstanceID: record.InstanceID}, nil
+			},
+		},
+		{
+			name: "api unavailable",
+			health: func(context.Context, string) (daemonclient.HealthResponse, error) {
+				return daemonclient.HealthResponse{}, context.DeadlineExceeded
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			signaled := false
+			err := stopDaemon(context.Background(), &cfg, tt.health, func(int) error {
+				signaled = true
+				return nil
+			})
+			if err == nil {
+				t.Fatal("expected refusal")
+			}
+			if signaled {
+				t.Fatal("must not signal an unverified process")
+			}
+		})
 	}
 }
 

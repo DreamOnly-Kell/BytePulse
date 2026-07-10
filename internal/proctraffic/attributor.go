@@ -4,10 +4,10 @@ package proctraffic
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"time"
 )
 
@@ -58,10 +58,40 @@ func (a readerAttributor) Run(ctx context.Context, onSample func([]Sample)) erro
 // first header line with each subsequent data line for ParseNettopCSV.
 // nettop -L 0 会先打印表头再持续输出数据行。我们将首行表头与后续每行数据配对交给 ParseNettopCSV。
 func scanNettopCSV(ctx context.Context, reader io.Reader, onSample func([]Sample)) error {
+	return scanNettopCSVWithClock(ctx, reader, onSample, time.Now)
+}
+
+func scanNettopCSVWithClock(ctx context.Context, reader io.Reader, onSample func([]Sample), now func() time.Time) error {
 	// Line scanner over the process stdout (or test buffer).
 	// 对进程 stdout（或测试 buffer）的行扫描器。
 	scanner := bufio.NewScanner(reader)
 	var header string
+	var rows []string
+	var epochStartedAt time.Time
+	firstEpoch := true
+	flush := func(boundary time.Time) {
+		if firstEpoch {
+			firstEpoch = false
+			rows = rows[:0]
+			return
+		}
+		if len(rows) == 0 {
+			return
+		}
+		var block strings.Builder
+		block.WriteString(header)
+		block.WriteByte('\n')
+		for _, row := range rows {
+			block.WriteString(row)
+			block.WriteByte('\n')
+		}
+		elapsed := boundary.Sub(epochStartedAt)
+		samples, err := parseNettopCSV(strings.NewReader(block.String()), boundary, elapsed)
+		if err == nil && len(samples) > 0 && onSample != nil {
+			onSample(samples)
+		}
+		rows = rows[:0]
+	}
 	for scanner.Scan() {
 		// Cooperative cancel between lines.
 		// 行与行之间协作式取消。
@@ -80,25 +110,24 @@ func scanNettopCSV(ctx context.Context, reader io.Reader, onSample func([]Sample
 		// 第一个非空行视为 CSV 表头。
 		if header == "" {
 			header = line
+			epochStartedAt = now()
 			continue
 		}
-		// Rebuild a tiny CSV document: header + one data row.
-		// 重建微型 CSV 文档：表头 + 一行数据。
-		block := header + "\n" + line + "\n"
-		samples, err := ParseNettopCSV(bytes.NewBufferString(block), time.Now())
-		// Ignore parse misses; keep reading subsequent lines.
-		// 忽略解析失败；继续读后续行。
-		if err != nil || len(samples) == 0 {
+		if line == header {
+			boundary := now()
+			flush(boundary)
+			epochStartedAt = boundary
 			continue
 		}
-		// Deliver this batch to the collector callback.
-		// 将本批交付给采集器回调。
-		onSample(samples)
+		rows = append(rows, line)
 	}
 	// Propagate scanner I/O errors (not EOF).
 	// 传播 scanner 的 I/O 错误（非 EOF）。
 	if err := scanner.Err(); err != nil {
 		return err
+	}
+	if len(rows) > 0 {
+		flush(now())
 	}
 	return nil
 }

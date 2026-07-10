@@ -25,7 +25,7 @@ func TestProcessesEndpointReadsRealtimeState(t *testing.T) {
 	state := processstate.New()
 	now := time.Date(2026, 7, 8, 10, 15, 1, 0, time.UTC)
 	state.Update([]proc.Connection{{PID: 1, ProcessName: "curl", ProcessKey: "1:0", SeenAt: now}}, now)
-	server := NewServer(state, fakeTopStore{}, config.Config{TopN: 30})
+	server := NewServer(state, fakeTopStore{}, config.Config{TopN: 30}, Identity{})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/processes", nil)
 	rec := httptest.NewRecorder()
@@ -44,7 +44,7 @@ func TestProcessesEndpointReadsRealtimeState(t *testing.T) {
 }
 
 func TestProcessConnectionsEndpointRequiresProcessKey(t *testing.T) {
-	server := NewServer(processstate.New(), fakeTopStore{}, config.Config{TopN: 30})
+	server := NewServer(processstate.New(), fakeTopStore{}, config.Config{TopN: 30}, Identity{})
 	req := httptest.NewRequest(http.MethodGet, "/api/processes/connections", nil)
 	rec := httptest.NewRecorder()
 
@@ -58,7 +58,7 @@ func TestProcessConnectionsEndpointRequiresProcessKey(t *testing.T) {
 func TestProcessesTopEndpointReadsStorageRollups(t *testing.T) {
 	server := NewServer(processstate.New(), fakeTopStore{
 		items: []storage.ProcessConnectionSummary{{PID: 1, ProcessName: "curl", ProcessKey: "1:0", ConnectionCount: 3}},
-	}, config.Config{TopN: 30})
+	}, config.Config{TopN: 30}, Identity{})
 	req := httptest.NewRequest(http.MethodGet, "/api/processes/top?range=24h", nil)
 	rec := httptest.NewRecorder()
 
@@ -77,7 +77,7 @@ func TestProcessesTopEndpointReadsStorageRollups(t *testing.T) {
 }
 
 func TestInvalidRangeReturnsBadRequest(t *testing.T) {
-	server := NewServer(processstate.New(), fakeTopStore{}, config.Config{TopN: 30})
+	server := NewServer(processstate.New(), fakeTopStore{}, config.Config{TopN: 30}, Identity{})
 	req := httptest.NewRequest(http.MethodGet, "/api/processes/top?range=nope", nil)
 	rec := httptest.NewRecorder()
 
@@ -85,5 +85,29 @@ func TestInvalidRangeReturnsBadRequest(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d, want 400", rec.Code)
+	}
+}
+
+func TestHealthEndpointReturnsDaemonIdentity(t *testing.T) {
+	state := processstate.New()
+	state.SetTrafficBackendStatus(processstate.TrafficBackendStatus{State: processstate.TrafficBackendHealthy})
+	server := NewServer(state, fakeTopStore{}, config.Config{TopN: 30}, Identity{
+		PID:        2468,
+		InstanceID: "instance-2468",
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d", rec.Code)
+	}
+	var got HealthResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !got.OK || got.PID != 2468 || got.InstanceID != "instance-2468" || got.ProcessTraffic.State != processstate.TrafficBackendHealthy {
+		t.Fatalf("health=%+v", got)
 	}
 }

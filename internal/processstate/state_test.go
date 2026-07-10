@@ -136,6 +136,73 @@ func TestUpdateTrafficDoesNotOverwriteConnectionPath(t *testing.T) {
 	}
 }
 
+func TestTrafficTTLExpiresAfterThreeSeconds(t *testing.T) {
+	state := New()
+	now := time.Date(2026, 7, 8, 10, 15, 1, 0, time.UTC)
+	conn := proc.Connection{PID: 1, ProcessName: "curl", ProcessKey: "1:1", SeenAt: now}
+	state.Update([]proc.Connection{conn}, now)
+	state.UpdateTraffic([]ProcessTrafficSample{{PID: 1, RXBps: 12, SeenAt: now, Source: "nettop"}})
+
+	conn.SeenAt = now.Add(2 * time.Second)
+	state.Update([]proc.Connection{conn}, conn.SeenAt)
+	if got := state.LatestSummaries(1); len(got) != 1 || !got[0].TrafficAvailable {
+		t.Fatalf("traffic should be available before TTL: %+v", got)
+	}
+
+	conn.SeenAt = now.Add(3 * time.Second)
+	state.Update([]proc.Connection{conn}, conn.SeenAt)
+	got := state.LatestSummaries(1)
+	if len(got) != 1 || got[0].TrafficAvailable || got[0].RXBps != 0 {
+		t.Fatalf("traffic should expire at TTL: %+v", got)
+	}
+}
+
+func TestTrafficPIDReuseDoesNotInheritPreviousProcess(t *testing.T) {
+	state := New()
+	now := time.Date(2026, 7, 8, 10, 15, 1, 0, time.UTC)
+	state.Update([]proc.Connection{{PID: 1, ProcessName: "old", ProcessKey: "1:old", SeenAt: now}}, now)
+	state.UpdateTraffic([]ProcessTrafficSample{{PID: 1, RXBps: 12, SeenAt: now, Source: "nettop"}})
+
+	next := now.Add(time.Second)
+	state.Update([]proc.Connection{{PID: 1, ProcessName: "new", ProcessKey: "1:new", SeenAt: next}}, next)
+	got := state.LatestSummaries(1)
+	if len(got) != 1 || got[0].TrafficAvailable {
+		t.Fatalf("reused PID inherited traffic: %+v", got)
+	}
+}
+
+func TestTrafficCachePrunesMissingPIDs(t *testing.T) {
+	state := New()
+	now := time.Date(2026, 7, 8, 10, 15, 1, 0, time.UTC)
+	state.Update([]proc.Connection{{PID: 1, ProcessName: "curl", ProcessKey: "1:1", SeenAt: now}}, now)
+	state.UpdateTraffic([]ProcessTrafficSample{{PID: 1, RXBps: 12, SeenAt: now, Source: "nettop"}})
+
+	state.Update(nil, now.Add(time.Second))
+	state.Update([]proc.Connection{{PID: 1, ProcessName: "curl", ProcessKey: "1:1", SeenAt: now.Add(2 * time.Second)}}, now.Add(2*time.Second))
+	got := state.LatestSummaries(1)
+	if len(got) != 1 || got[0].TrafficAvailable {
+		t.Fatalf("missing PID cache was not pruned: %+v", got)
+	}
+}
+
+func TestTrafficBackendStatusAndClear(t *testing.T) {
+	state := New()
+	now := time.Date(2026, 7, 8, 10, 15, 1, 0, time.UTC)
+	state.Update([]proc.Connection{{PID: 1, ProcessName: "curl", ProcessKey: "1:1", SeenAt: now}}, now)
+	state.UpdateTraffic([]ProcessTrafficSample{{PID: 1, RXBps: 12, SeenAt: now, Source: "nettop"}})
+	state.SetTrafficBackendStatus(TrafficBackendStatus{State: TrafficBackendDegraded, LastError: "nettop failed"})
+	state.ClearTraffic()
+
+	status := state.TrafficBackendStatus()
+	if status.State != TrafficBackendDegraded || status.LastError != "nettop failed" {
+		t.Fatalf("status=%+v", status)
+	}
+	got := state.LatestSummaries(1)
+	if len(got) != 1 || got[0].TrafficAvailable || got[0].RXBps != 0 {
+		t.Fatalf("traffic not cleared: %+v", got)
+	}
+}
+
 func TestMinuteBucketAccumulatesSampleCountAndMaxConnections(t *testing.T) {
 	state := New()
 	now := time.Date(2026, 7, 8, 10, 15, 1, 0, time.UTC)
@@ -171,6 +238,38 @@ func TestFlushCompletedKeepsCurrentMinuteInMemory(t *testing.T) {
 	}
 	if got := state.FlushBefore(now.Add(time.Minute)); len(got) != 1 {
 		t.Fatalf("len=%d, want 1", len(got))
+	}
+}
+
+func TestDrainAllMinutesIncludesCurrentMinute(t *testing.T) {
+	state := New()
+	now := time.Date(2026, 7, 8, 10, 15, 1, 0, time.UTC)
+	state.Update([]proc.Connection{{PID: 1, ProcessName: "A", ProcessKey: "1:1", SeenAt: now}}, now)
+
+	got := state.DrainAllMinutes()
+	if len(got) != 1 || got[0].ProcessKey != "1:1" {
+		t.Fatalf("drained=%+v", got)
+	}
+	if again := state.DrainAllMinutes(); len(again) != 0 {
+		t.Fatalf("drain did not remove buckets: %+v", again)
+	}
+}
+
+func TestRestoreMinutesMergesWithoutLosingCounts(t *testing.T) {
+	state := New()
+	now := time.Date(2026, 7, 8, 10, 15, 1, 0, time.UTC)
+	state.RestoreMinutes([]ProcessConnectionMinute{{
+		MinuteStart: now.Truncate(time.Minute), ProcessKey: "1:1", PID: 1,
+		ProcessName: "A", MaxConnectionCount: 2, SampleCount: 3, LastSeen: now,
+	}})
+	state.RestoreMinutes([]ProcessConnectionMinute{{
+		MinuteStart: now.Truncate(time.Minute), ProcessKey: "1:1", PID: 1,
+		ProcessName: "A", MaxConnectionCount: 4, SampleCount: 2, LastSeen: now.Add(time.Second),
+	}})
+
+	got := state.DrainAllMinutes()
+	if len(got) != 1 || got[0].MaxConnectionCount != 4 || got[0].SampleCount != 5 || !got[0].LastSeen.Equal(now.Add(time.Second)) {
+		t.Fatalf("restored=%+v", got)
 	}
 }
 

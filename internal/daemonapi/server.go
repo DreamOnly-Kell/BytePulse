@@ -21,6 +21,22 @@ type Store interface {
 	TopProcessConnectionMinutes(start, end time.Time, limit int) ([]storage.ProcessConnectionSummary, error)
 }
 
+// Identity identifies one daemon lifetime.
+// Identity 标识一个 daemon 生命周期。
+type Identity struct {
+	PID        int
+	InstanceID string
+}
+
+// HealthResponse is returned by the daemon liveness endpoint.
+// HealthResponse 是 daemon 存活检查端点的响应。
+type HealthResponse struct {
+	OK             bool                              `json:"ok"`
+	PID            int                               `json:"pid"`
+	InstanceID     string                            `json:"instance_id"`
+	ProcessTraffic processstate.TrafficBackendStatus `json:"process_traffic"`
+}
+
 // Server is the daemon API HTTP handler set.
 // Server 是 daemon API 的 HTTP handler 集合。
 type Server struct {
@@ -32,7 +48,8 @@ type Server struct {
 	store Store
 	// cfg supplies default TopN and related settings.
 	// cfg 提供默认 TopN 及相关设置。
-	cfg config.Config
+	cfg      config.Config
+	identity Identity
 	// mux routes API paths.
 	// mux 路由 API 路径。
 	mux *http.ServeMux
@@ -40,12 +57,13 @@ type Server struct {
 
 // NewServer constructs the API server and registers routes.
 // NewServer 构造 API 服务器并注册路由。
-func NewServer(state *processstate.State, store Store, cfg config.Config) *Server {
+func NewServer(state *processstate.State, store Store, cfg config.Config, identity Identity) *Server {
 	s := &Server{
-		state: state,
-		store: store,
-		cfg:   cfg,
-		mux:   http.NewServeMux(),
+		state:    state,
+		store:    store,
+		cfg:      cfg,
+		identity: identity,
+		mux:      http.NewServeMux(),
 	}
 	s.routes()
 	return s
@@ -81,7 +99,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
 		return
 	}
-	writeJSON(w, map[string]bool{"ok": true})
+	writeJSON(w, HealthResponse{
+		OK:             true,
+		PID:            s.identity.PID,
+		InstanceID:     s.identity.InstanceID,
+		ProcessTraffic: s.state.TrafficBackendStatus(),
+	})
 }
 
 // handleProcesses returns the latest in-memory process summaries.

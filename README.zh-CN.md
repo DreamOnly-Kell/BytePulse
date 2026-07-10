@@ -14,7 +14,7 @@ BytePulse 是**本地、按需使用的网络排障工具**——偶尔打开看
 - 自动单位 `B/s`、`KB/s`、`MB/s`、`GB/s`（可用 `--bits` 显示 bits/s）。
 - 滚动窗口流量统计：`1h` … `15d`，以及每小时/每天聚合 API。
 - CLI、TUI、本地 Web（进程视图共用 daemon API）。
-- **单实例 daemon：** PID 文件排他锁；第二次启动会被拦住，并提示先 stop 再 start。
+- **单实例 daemon：** PID 文件排他锁与 daemon 实例身份；第二次启动会被拦住，并提示先 stop 再 start。
 - 通过 `--interface` 过滤指定网卡。
 - 进程连接发现：进程名、完整路径、PID、连接数、最后出现时间。
 - 可选每进程 RX/TX：macOS `nettop`，Windows TCP ESTATS（`--process-traffic auto`）。
@@ -38,8 +38,9 @@ BytePulse 是**本地、按需使用的网络排障工具**——偶尔打开看
 ## 设计说明（明确不做 / 不做默认）
 
 - **默认不是 7×24 后台服务。** daemon 是可选的：排障时启动，结束后 `stop`。`launchd` / systemd 等安装方式是后续可选项，不是日常用法的前提。
-- **只允许一个采集 daemon（强制）。** 出现以下任一情况时，第二次 `daemon` 会被拒绝：PID 文件指向的进程仍存活、PID 文件已被排他锁定、或 daemon API 的 `/api/health` 已可用。提示会要求先 `bytepulse stop`，再重新启动。多个查看端（TUI、Web、CLI）共用一个 daemon 是正常用法。
-- **TUI/Web 不会自动启动 daemon。** daemon 未就绪时：TUI 停留等待刷新；Web 仍可读 SQLite 显示网卡图，进程表显示等待；CLI 进程命令报错并提示如何启动。
+- **只允许一个采集 daemon（强制）。** PID 文件已被排他锁定，或配置的 daemon API 已能响应 `/api/health` 时，第二次 `daemon` 会被拒绝。未锁定的陈旧 PID 文件会被安全替换，即使旧 PID 已被其他进程复用。多个查看端（TUI、Web、CLI）共用一个 daemon 是正常用法。
+- **停止前校验身份。** PID 文件保存随机 daemon 实例 ID。只有 `/api/health` 返回的 PID 和实例 ID 都与 PID 文件一致时，`bytepulse stop` 才会发送停止信号，避免陈旧 PID 文件误停其他进程。
+- **TUI/Web 不会自动启动 daemon。** daemon 未就绪时：TUI 流量页和 Web 网卡图仍可读取 SQLite，进程视图等待 daemon；CLI 进程命令报错并提示如何启动。
 - **不抓包**，也**不依赖常驻内核代理**——只用系统计数器与平台 API。
 - **Linux 进程监控**不在当前阶段范围内。
 
@@ -233,7 +234,7 @@ cp config.example.yaml ~/.bytepulse/config.yaml
 ./bytepulse --lang zh tui
 ```
 
-**daemon 未启动时：** TUI 停在等待/重试界面（请在另一终端执行 `bytepulse daemon`）。Web 仍可从 SQLite 显示网卡图表，进程表显示等待提示。CLI `processes` 报错并给出启动命令。查看端**不会**自动拉起 daemon。
+**daemon 未启动时：** TUI 流量页和 Web 网卡图仍可读取 SQLite；进程视图显示等待/重试状态。CLI `processes` 报错并给出启动命令。查看端**不会**自动拉起 daemon。
 
 从进程视图中隐藏 BytePulse 自身（默认开启）。匹配依据为 daemon 自身 PID，以及可执行名 `bytepulse` / `bytepulse.exe`：
 
@@ -266,11 +267,11 @@ cp config.example.yaml ~/.bytepulse/config.yaml
 
 默认保留最近 30 天的采样数据。默认采集间隔是 1 秒，也可以通过 `daemon --interval` 修改。每条网卡采样包含时间戳、网卡名称、接收字节、发送字节、接收速度、发送速度和采样间隔。
 
-进程连接监控同样每 1 秒采样，但不会把每秒原始连接快照写入 SQLite。**daemon 在内存中**保存最新进程连接状态，供 CLI / TUI / Web 实时视图使用；SQLite 只写入**分钟级**进程聚合，供历史报表（`processes --range`、top API）使用。
+进程连接监控同样每 1 秒采样，但不会把每秒原始连接快照写入 SQLite。**daemon 在内存中**保存最新进程连接状态，供 CLI / TUI / Web 实时视图使用；SQLite 只写入**分钟级**进程聚合，供历史报表（`processes --range`、top API）使用。正常退出时也会刷写当前尚未结束的分钟。数据保留清理在启动时执行一次，之后最多每小时执行一次，不再每秒执行。
 
 滚动统计按采样时间戳归属样本。默认 1 秒间隔下，窗口边界误差最多约为一个采样间隔。每日聚合当前按 Unix 日边界分桶。
 
-**同一时间只允许一个采集 daemon**（PID 文件锁 + 进程存活检测 + API 健康检查）。再启第二个会直接报错，需先 `bytepulse stop`。一个 daemon 上挂多个查看端是正常用法。默认 PID 路径：
+对于同一组 PID 文件/API 配置，**同一时间只允许一个采集 daemon**（PID 文件锁 + API 健康检查）。PID 文件还保存随机实例 ID，供 `bytepulse stop` 校验目标身份。再启第二个会直接报错，需先停止已有 daemon。一个 daemon 上挂多个查看端是正常用法。默认 PID 路径：
 
 ```text
 ~/.bytepulse/bytepulse.pid
@@ -307,6 +308,8 @@ GET /api/processes?limit=30
 GET /api/processes/connections?process_key=<key>
 GET /api/processes/top?range=24h&limit=30
 ```
+
+`/api/health` 会返回 daemon 身份，以及每进程流量后端状态：`disabled`、`starting`、`healthy` 或 `degraded`。
 
 ## 后续计划
 

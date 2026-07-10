@@ -41,8 +41,8 @@ type Options struct {
 	// Interface limits sampling to one NIC; empty = all non-loopback.
 	// Interface 将采样限制为单网卡；空 = 所有非回环。
 	Interface string
-	// Retention is passed to Cleanup after each successful insert.
-	// Retention 在每次成功插入后传给 Cleanup。
+	// Retention is used by startup and hourly cleanup.
+	// Retention 用于启动时及每小时清理。
 	Retention time.Duration
 }
 
@@ -60,9 +60,12 @@ type Store interface {
 // Collector diffs interface counters on a ticker and stores samples.
 // Collector 在定时器上对网卡计数做差分并落库。
 type Collector struct {
-	store Store
-	opts  Options
+	store       Store
+	opts        Options
+	nextCleanup time.Time
 }
+
+const cleanupInterval = time.Hour
 
 // New builds a Collector with sane defaults for interval/retention.
 // New 构造 Collector，并为间隔/保留期填入合理默认值。
@@ -94,6 +97,9 @@ func (c *Collector) Run(ctx context.Context) error {
 	// Timestamp of the baseline (or last successful sample).
 	// 基线（或上次成功样本）的时间戳。
 	prevAt := time.Now()
+	if err := c.cleanupIfDue(prevAt); err != nil {
+		return err
+	}
 
 	// Fire on each sampling interval.
 	// 每个采样间隔触发一次。
@@ -125,12 +131,6 @@ func (c *Collector) Run(ctx context.Context) error {
 					logx.Error("insert samples failed", "component", "collector", "err", err, "n", len(samples))
 					return err
 				}
-				// Drop rows older than retention (runs every successful tick).
-				// 删除超过保留期的行（每次成功采样都会跑）。
-				if err := c.store.Cleanup(now, c.opts.Retention); err != nil {
-					logx.Error("cleanup samples failed", "component", "collector", "err", err)
-					return err
-				}
 				var rx, tx uint64
 				for _, s := range samples {
 					rx += s.RXBytes
@@ -146,6 +146,9 @@ func (c *Collector) Run(ctx context.Context) error {
 			} else {
 				logx.Debug("no interface samples this tick", "component", "collector", "ifaces_seen", len(current))
 			}
+			if err := c.cleanupIfDue(now); err != nil {
+				return err
+			}
 
 			// Advance baseline for the next tick.
 			// 推进基线供下一拍使用。
@@ -153,6 +156,19 @@ func (c *Collector) Run(ctx context.Context) error {
 			prevAt = now
 		}
 	}
+}
+
+func (c *Collector) cleanupIfDue(now time.Time) error {
+	if !c.nextCleanup.IsZero() && now.Before(c.nextCleanup) {
+		return nil
+	}
+	c.nextCleanup = now.Add(cleanupInterval)
+	if err := c.store.Cleanup(now, c.opts.Retention); err != nil {
+		logx.Error("cleanup samples failed", "component", "collector", "err", err)
+		return err
+	}
+	logx.Debug("interface samples cleanup ok", "component", "collector", "retention", c.opts.Retention.String())
+	return nil
 }
 
 // ReadCounters reads counters for collection (excludes loopback when all).
@@ -248,10 +264,10 @@ func diff(prev, current []InterfaceCounter, prevAt, now time.Time) []storage.Sam
 		rxDelta := c.RXBytes - p.RXBytes
 		txDelta := c.TXBytes - p.TXBytes
 		samples = append(samples, storage.Sample{
-			Timestamp:   now,
-			Interface:   c.Name,
-			RXBytes:     rxDelta,
-			TXBytes:     txDelta,
+			Timestamp: now,
+			Interface: c.Name,
+			RXBytes:   rxDelta,
+			TXBytes:   txDelta,
 			// Speeds are average B/s over this interval.
 			// 速率为本区间平均 B/s。
 			RXSpeedBps:  float64(rxDelta) / seconds,

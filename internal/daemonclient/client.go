@@ -26,6 +26,15 @@ type Client struct {
 	HTTPClient *http.Client
 }
 
+// HealthResponse identifies the daemon answering the health endpoint.
+// HealthResponse 标识响应 health 端点的 daemon 实例。
+type HealthResponse struct {
+	OK             bool                              `json:"ok"`
+	PID            int                               `json:"pid"`
+	InstanceID     string                            `json:"instance_id"`
+	ProcessTraffic processstate.TrafficBackendStatus `json:"process_traffic"`
+}
+
 // New builds a client for addr (host:port or full URL).
 // New 为 addr（host:port 或完整 URL）构建客户端。
 func New(addr string) *Client {
@@ -62,6 +71,19 @@ func (c *Client) Health(ctx context.Context) error {
 		return fmt.Errorf("daemon API health returned status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// HealthInfo returns the daemon identity used by safety-sensitive callers.
+// HealthInfo 返回供安全敏感调用方校验的 daemon 实例身份。
+func (c *Client) HealthInfo(ctx context.Context) (HealthResponse, error) {
+	var out HealthResponse
+	if err := c.get(ctx, "/api/health", nil, &out); err != nil {
+		return HealthResponse{}, err
+	}
+	if !out.OK || out.PID <= 0 || strings.TrimSpace(out.InstanceID) == "" {
+		return HealthResponse{}, fmt.Errorf("daemon API returned incomplete identity")
+	}
+	return out, nil
 }
 
 // Processes fetches the realtime process summary list.

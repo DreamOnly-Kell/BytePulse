@@ -10,6 +10,25 @@ import (
 	"bytepulse/internal/proc"
 )
 
+const trafficTTL = 3 * time.Second
+
+type TrafficBackendState string
+
+const (
+	TrafficBackendDisabled TrafficBackendState = "disabled"
+	TrafficBackendStarting TrafficBackendState = "starting"
+	TrafficBackendHealthy  TrafficBackendState = "healthy"
+	TrafficBackendDegraded TrafficBackendState = "degraded"
+)
+
+// TrafficBackendStatus describes availability of optional per-process attribution.
+// TrafficBackendStatus 描述可选进程流量归因后端的可用状态。
+type TrafficBackendStatus struct {
+	State        TrafficBackendState `json:"state"`
+	LastSampleAt time.Time           `json:"last_sample_at,omitempty"`
+	LastError    string              `json:"last_error,omitempty"`
+}
+
 // ProcessConnectionDetail is one socket row shown in connection drill-down.
 // ProcessConnectionDetail 是连接下钻视图中的一条套接字记录。
 type ProcessConnectionDetail struct {
@@ -29,10 +48,10 @@ type ProcessConnectionDetail struct {
 // ProcessConnectionSummary is one process row for top lists (with optional rates).
 // ProcessConnectionSummary 是排行列表中的一行进程（含可选速率）。
 type ProcessConnectionSummary struct {
-	PID         int       `json:"pid"`
-	ProcessName string    `json:"process_name"`
-	ProcessPath string    `json:"process_path"`
-	ProcessKey  string    `json:"process_key"`
+	PID         int    `json:"pid"`
+	ProcessName string `json:"process_name"`
+	ProcessPath string `json:"process_path"`
+	ProcessKey  string `json:"process_key"`
 	// ConnectionCount is the number of sockets in the latest sample.
 	// ConnectionCount 是最近一次采样中的套接字数量。
 	ConnectionCount int `json:"connection_count"`
@@ -63,6 +82,11 @@ type ProcessTrafficSample struct {
 	Source string `json:"source"`
 }
 
+type trafficCacheEntry struct {
+	Sample     ProcessTrafficSample
+	ProcessKey string
+}
+
 // ProcessConnectionMinute is the in-memory minute rollup before SQLite flush.
 // ProcessConnectionMinute 是刷入 SQLite 前的内存分钟聚合。
 type ProcessConnectionMinute struct {
@@ -90,7 +114,8 @@ type State struct {
 	latestConnections map[string][]ProcessConnectionDetail
 	// latestTraffic caches last known rates by PID from the traffic collector.
 	// latestTraffic 缓存流量采集器按 PID 的最近已知速率。
-	latestTraffic map[int]ProcessTrafficSample
+	latestTraffic map[int]trafficCacheEntry
+	trafficStatus TrafficBackendStatus
 	// minuteBuckets accumulates current/previous minute rollups pending flush.
 	// minuteBuckets 累积待刷写的当前/过去分钟聚合。
 	minuteBuckets map[string]ProcessConnectionMinute
@@ -101,7 +126,8 @@ type State struct {
 func New() *State {
 	return &State{
 		latestConnections: map[string][]ProcessConnectionDetail{},
-		latestTraffic:     map[int]ProcessTrafficSample{},
+		latestTraffic:     map[int]trafficCacheEntry{},
+		trafficStatus:     TrafficBackendStatus{State: TrafficBackendDisabled},
 		minuteBuckets:     map[string]ProcessConnectionMinute{},
 	}
 }
@@ -136,6 +162,18 @@ func (s *State) Update(conns []proc.Connection, now time.Time) {
 	// 全量替换（非合并），使已关闭套接字在下一秒消失。
 	s.latestConnections = byProcess
 	s.latestSummaries = make([]ProcessConnectionSummary, 0, len(byProcess))
+	currentByPID := make(map[int]string, len(byProcess))
+	for key, details := range byProcess {
+		if len(details) > 0 {
+			currentByPID[details[0].PID] = key
+		}
+	}
+	for pid, entry := range s.latestTraffic {
+		processKey, exists := currentByPID[pid]
+		if !exists || (entry.ProcessKey != "" && entry.ProcessKey != processKey) || !trafficFresh(entry.Sample, now) {
+			delete(s.latestTraffic, pid)
+		}
+	}
 	// Roll up into the clock minute containing `now`.
 	// 汇总到包含 `now` 的时钟分钟。
 	minuteStart := now.Truncate(time.Minute)
@@ -159,8 +197,12 @@ func (s *State) Update(conns []proc.Connection, now time.Time) {
 		}
 		// Attach cached traffic rates if we have a sample for this PID.
 		// 若该 PID 有缓存流量样本则挂上速率。
-		if sample, ok := s.latestTraffic[summary.PID]; ok {
-			applyTraffic(&summary, sample)
+		if entry, ok := s.latestTraffic[summary.PID]; ok {
+			if entry.ProcessKey == "" {
+				entry.ProcessKey = summary.ProcessKey
+				s.latestTraffic[summary.PID] = entry
+			}
+			applyTraffic(&summary, entry.Sample)
 		}
 		s.latestSummaries = append(s.latestSummaries, summary)
 
@@ -226,9 +268,14 @@ func (s *State) UpdateTraffic(samples []ProcessTrafficSample) {
 			continue
 		}
 		byPID[sample.PID] = sample
-		// Persist last-known sample even if process list updates later.
-		// 即使进程列表稍后更新也保留最近已知样本。
-		s.latestTraffic[sample.PID] = sample
+		entry := trafficCacheEntry{Sample: sample}
+		for _, summary := range s.latestSummaries {
+			if summary.PID == sample.PID {
+				entry.ProcessKey = summary.ProcessKey
+				break
+			}
+		}
+		s.latestTraffic[sample.PID] = entry
 	}
 	if len(byPID) == 0 {
 		return
@@ -242,6 +289,33 @@ func (s *State) UpdateTraffic(samples []ProcessTrafficSample) {
 			continue
 		}
 		applyTraffic(&s.latestSummaries[i], sample)
+	}
+}
+
+// SetTrafficBackendStatus replaces the optional backend health snapshot.
+// SetTrafficBackendStatus 替换可选流量后端的健康状态。
+func (s *State) SetTrafficBackendStatus(status TrafficBackendStatus) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.trafficStatus = status
+}
+
+// TrafficBackendStatus returns a copy of the backend health snapshot.
+// TrafficBackendStatus 返回流量后端健康状态的副本。
+func (s *State) TrafficBackendStatus() TrafficBackendStatus {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.trafficStatus
+}
+
+// ClearTraffic removes cached attribution and clears rates from live rows.
+// ClearTraffic 清除缓存归因及实时行中的速率。
+func (s *State) ClearTraffic() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.latestTraffic = map[int]trafficCacheEntry{}
+	for i := range s.latestSummaries {
+		clearTraffic(&s.latestSummaries[i])
 	}
 }
 
@@ -264,6 +338,49 @@ func (s *State) FlushCompleted(before time.Time) []ProcessConnectionMinute {
 // FlushBefore 是测试/辅助路径，可包含上一分钟边界。
 func (s *State) FlushBefore(before time.Time) []ProcessConnectionMinute {
 	return s.flush(before.Truncate(time.Minute), true)
+}
+
+// DrainAllMinutes removes and returns every pending minute, including current.
+// DrainAllMinutes 移除并返回所有待刷分钟，包括当前分钟。
+func (s *State) DrainAllMinutes() []ProcessConnectionMinute {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]ProcessConnectionMinute, 0, len(s.minuteBuckets))
+	for key, bucket := range s.minuteBuckets {
+		out = append(out, bucket)
+		delete(s.minuteBuckets, key)
+	}
+	sortMinutes(out)
+	return out
+}
+
+// RestoreMinutes merges drained minutes back after persistence failure.
+// RestoreMinutes 在持久化失败后把已取出的分钟合并回内存。
+func (s *State) RestoreMinutes(minutes []ProcessConnectionMinute) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, minute := range minutes {
+		key := bucketKey(minute.MinuteStart, minute.ProcessKey)
+		existing, ok := s.minuteBuckets[key]
+		if !ok {
+			s.minuteBuckets[key] = minute
+			continue
+		}
+		if minute.MaxConnectionCount > existing.MaxConnectionCount {
+			existing.MaxConnectionCount = minute.MaxConnectionCount
+		}
+		existing.SampleCount += minute.SampleCount
+		if minute.LastSeen.After(existing.LastSeen) {
+			existing.LastSeen = minute.LastSeen
+		}
+		if existing.ProcessName == "" {
+			existing.ProcessName = minute.ProcessName
+		}
+		if existing.ProcessPath == "" {
+			existing.ProcessPath = minute.ProcessPath
+		}
+		s.minuteBuckets[key] = existing
+	}
 }
 
 // flush implements the shared minute-bucket eviction logic.
@@ -290,13 +407,17 @@ func (s *State) flush(cutoff time.Time, includeCutoff bool) []ProcessConnectionM
 	}
 	// Stable order for deterministic DB writes/tests.
 	// 稳定顺序，保证写库/测试可预期。
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].MinuteStart.Equal(out[j].MinuteStart) {
-			return out[i].ProcessKey < out[j].ProcessKey
-		}
-		return out[i].MinuteStart.Before(out[j].MinuteStart)
-	})
+	sortMinutes(out)
 	return out
+}
+
+func sortMinutes(items []ProcessConnectionMinute) {
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].MinuteStart.Equal(items[j].MinuteStart) {
+			return items[i].ProcessKey < items[j].ProcessKey
+		}
+		return items[i].MinuteStart.Before(items[j].MinuteStart)
+	})
 }
 
 // sortSummaries orders by connection count desc, then name, then PID.
@@ -335,6 +456,23 @@ func applyTraffic(summary *ProcessConnectionSummary, sample ProcessTrafficSample
 	if sample.SeenAt.After(summary.LastSeen) {
 		summary.LastSeen = sample.SeenAt
 	}
+}
+
+func clearTraffic(summary *ProcessConnectionSummary) {
+	summary.RXBytes = 0
+	summary.TXBytes = 0
+	summary.RXBps = 0
+	summary.TXBps = 0
+	summary.TrafficSource = ""
+	summary.TrafficAvailable = false
+}
+
+func trafficFresh(sample ProcessTrafficSample, now time.Time) bool {
+	if sample.SeenAt.IsZero() {
+		return false
+	}
+	age := now.Sub(sample.SeenAt)
+	return age >= 0 && age < trafficTTL
 }
 
 // bucketKey uniquely identifies a process within a minute for the map.

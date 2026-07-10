@@ -30,8 +30,9 @@ func (f *fakeProcessSampler) Sample() ([]proc.Connection, error) {
 }
 
 type fakeProcessStore struct {
-	minutes []storage.ProcessConnectionMinute
-	err     error
+	minutes      []storage.ProcessConnectionMinute
+	err          error
+	cleanupCalls int
 }
 
 func (f *fakeProcessStore) UpsertProcessConnectionMinutes(items []storage.ProcessConnectionMinute) error {
@@ -43,6 +44,7 @@ func (f *fakeProcessStore) UpsertProcessConnectionMinutes(items []storage.Proces
 }
 
 func (f *fakeProcessStore) CleanupProcessConnectionMinutes(time.Time, time.Duration) error {
+	f.cleanupCalls++
 	return nil
 }
 
@@ -85,7 +87,7 @@ func TestProcessConnectionCollectorFlushesCompletedMinute(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 15, 1, 0, time.UTC)
 	state.Update([]proc.Connection{{PID: 1, ProcessName: "curl", ProcessKey: "1:0", SeenAt: now}}, now)
 
-	err := flushProcessMinutes(store, state, now.Add(time.Minute), time.Hour)
+	err := flushProcessMinutes(store, state, now.Add(time.Minute))
 	if err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -168,8 +170,48 @@ func TestProcessConnectionCollectorReturnsStoreError(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 15, 1, 0, time.UTC)
 	state.Update([]proc.Connection{{PID: 1, ProcessName: "curl", ProcessKey: "1:0", SeenAt: now}}, now)
 
-	err := flushProcessMinutes(store, state, now.Add(time.Minute), time.Hour)
+	err := flushProcessMinutes(store, state, now.Add(time.Minute))
 	if !errors.Is(err, storeErr) {
 		t.Fatalf("err=%v, want %v", err, storeErr)
+	}
+	store.err = nil
+	if err := flushProcessMinutes(store, state, now.Add(time.Minute)); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if len(store.minutes) != 1 {
+		t.Fatalf("failed flush was not restored: %+v", store.minutes)
+	}
+}
+
+func TestProcessConnectionCollectorShutdownFlushesCurrentMinute(t *testing.T) {
+	state := processstate.New()
+	store := &fakeProcessStore{}
+	now := time.Date(2026, 7, 8, 10, 15, 1, 0, time.UTC)
+	state.Update([]proc.Connection{{PID: 1, ProcessName: "curl", ProcessKey: "1:0", SeenAt: now}}, now)
+
+	if err := flushAllProcessMinutes(store, state); err != nil {
+		t.Fatalf("shutdown flush: %v", err)
+	}
+	if len(store.minutes) != 1 || store.minutes[0].ProcessKey != "1:0" {
+		t.Fatalf("minutes=%+v", store.minutes)
+	}
+}
+
+func TestProcessConnectionCollectorShutdownRestoresOnStoreError(t *testing.T) {
+	state := processstate.New()
+	storeErr := errors.New("store down")
+	store := &fakeProcessStore{err: storeErr}
+	now := time.Date(2026, 7, 8, 10, 15, 1, 0, time.UTC)
+	state.Update([]proc.Connection{{PID: 1, ProcessName: "curl", ProcessKey: "1:0", SeenAt: now}}, now)
+
+	if err := flushAllProcessMinutes(store, state); !errors.Is(err, storeErr) {
+		t.Fatalf("err=%v want=%v", err, storeErr)
+	}
+	store.err = nil
+	if err := flushAllProcessMinutes(store, state); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if len(store.minutes) != 1 {
+		t.Fatalf("failed shutdown flush was not restored: %+v", store.minutes)
 	}
 }
